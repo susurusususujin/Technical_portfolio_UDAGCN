@@ -1,0 +1,2239 @@
+import os, json, re, random
+from types import SimpleNamespace
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.nn import Parameter
+
+# GPU 선택 (필요시 변경)
+os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# CompGCN 모듈 
+from model.compgcn_conv import CompGCNConv
+# from model.compgcn_conv_basis import CompGCNConvBasis  # 필요시
+
+print("✅ Torch:", torch.__version__, "| CUDA:", torch.version.cuda)
+
+class Args:
+    graph = "01.12_total.json"
+    epochs = 200
+    seed = 42
+    lr = 3e-3
+    encoder_dim = 128
+    init_dim = 64
+    gcn_dim = 128
+    dropout = 0.1
+    entropy_w = 0.01
+    grl_lambda_max = 0.05
+    print_every = 1
+    patience = 20
+    neg_ratio = 8
+    max_negs = 150_000
+    eval_sample_limit = 4096
+    rank_sample_queries = 1000  # 랭킹 질의 최대 개수
+
+# 🔎 작은 탐색공간
+Args.search_neg_ratio   = [1, 5, 7, 8, 9]
+Args.search_grl_lambda  = [0.01, 0.05, 0.10, 0.15, 0.20]
+Args.search_entropy_w   = [0.01, 0.02, 0.03, 0.04, 0.05]
+Args.gs_epochs_per_trial = 500
+Args.patience = 20
+Args.balance_ce = False
+
+# 하드 네거티브 마이닝 설정
+Args.hard_negative        = True
+Args.hard_warmup          = 3
+Args.hard_pool_multiplier = 5
+Args.hard_pool_cap        = 200_000
+Args.hard_topk_per_pos    = 2
+Args.hard_strategy        = "topk"    # "topk" 또는 "semi"
+Args.hard_semi_low        = 0.4
+Args.hard_semi_high       = 0.7
+Args.false_neg_filter     = True
+
+args = Args()
+
+def set_seed(seed=42):
+    random.seed(seed); np.random.seed(seed)
+    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+device = get_device()
+set_seed(args.seed)
+
+# 도메인/역할 매핑 및 라벨 파서
+DOMAIN_MAP = {"ai":0, "MB":1, "mb":1, "AE":2, "ae":2}
+ROLE_MAP   = {"problem":0, "solution":1}
+
+# 다양한 구분자 지원 ( ; / | , _ 공백 & : - )
+_SPLIT_RE = re.compile(r"[;/|,_\s&:\-]+")
+
+def parse_domain_role_from_labels(label):
+    """
+    label 이 문자열/리스트 어느 형태든 robust하게 파싱.
+    한 노드에서 여러 도메인이 검출되면 우선순위 하나만 선택:
+      Manufacturing(3) > Biology(2) > AI(1)
+    """
+    dom = -1; role = -1
+    if label is None:
+        return dom, role
+
+    # 1) 문자열 리스트로 평탄화
+    raw_tokens = []
+    if isinstance(label, str):
+        raw_tokens = [label]
+    elif isinstance(label, (list, tuple)):
+        for x in label:
+            if x is None: continue
+            raw_tokens.append(x if isinstance(x, str) else str(x))
+    else:
+        raw_tokens = [str(label)]
+
+    # 2) 토큰화/정규화
+    toks = []
+    for s in raw_tokens:
+        for t in _SPLIT_RE.split(s):
+            t = t.strip().lower()
+            if t: toks.append(t)
+    seen = set(); toks_unique = []
+    for t in toks:
+        if t not in seen:
+            toks_unique.append(t); seen.add(t)
+
+    # 역할
+    for t in toks_unique:
+        if t in ROLE_MAP and role < 0:
+            role = ROLE_MAP[t]
+
+    # 도메인 우선순위
+    prio = {"MB":3, "mb":3, "AE":2, "ae":2, "ai":1}
+    best = (-1, 0)  # (dom_id, priority)
+    for t in toks_unique:
+        if t in DOMAIN_MAP:
+            cand = (DOMAIN_MAP[t], prio.get(t, 0))
+            if cand[1] > best[1]:
+                best = cand
+    dom = best[0]
+    return dom, role
+
+def _parse_identity_from_elementId(elementId: str):
+    try:
+        return int(str(elementId).split(":")[-1])
+    except Exception:
+        return None
+
+def load_graph_json(path: str):
+    with open(path, "r", encoding="utf-8-sig") as f:
+        s = f.read().strip()
+    if not s: raise ValueError(f"Empty JSON: {path}")
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
+        obj = [json.loads(ln) for ln in lines]
+
+    def is_row(x): return isinstance(x, dict) and ("n" in x and "r" in x and "m" in x)
+
+    nodes, edges = [], []
+    if isinstance(obj, list) and len(obj)>0 and is_row(obj[0]):
+        # Triplet 스타일
+        node_map = {}
+        def pick_name(nd):
+            props = nd.get("properties", {}) or {}
+            return props.get("name") or props.get("title") or props.get("label") or str(nd.get("identity","")) or nd.get("elementId","")
+        for row in obj:
+            n = row.get("n", {}); m = row.get("m", {}); r = row.get("r", {})
+            for nd in (n, m):
+                nid = nd.get("identity", nd.get("elementId", None))
+                if nid is None: continue
+                # 문자열화(나중에 id2idx 키로 사용)
+                nid_str = str(nid)
+
+                raw_labels = nd.get("labels", [])
+                if not raw_labels:
+                    raw_labels = nd.get("label") or nd.get("type") or ""
+                dom, role = parse_domain_role_from_labels(raw_labels)
+
+                if nid_str not in node_map:
+                    node_map[nid_str] = {
+                        "id": nid_str,
+                        "name": pick_name(nd),
+                        "labels": raw_labels,   # 원본 라벨 보존
+                        "domain": dom,
+                        "role": role
+                    }
+                else:
+                    if node_map[nid_str]["domain"] < 0 and dom >= 0: node_map[nid_str]["domain"] = dom
+                    if node_map[nid_str]["role"]   < 0 and role>= 0: node_map[nid_str]["role"]   = role
+
+            start = r.get("start"); end = r.get("end"); rtype = r.get("type", "rel")
+            if start is not None and end is not None:
+                edges.append((str(start), str(end), str(rtype)))
+        nodes = list(node_map.values())
+    else:
+        # 자유형 JSON
+        def is_edge_dict(d):
+            return isinstance(d, dict) and any(k in d for k in ("source","start","src")) and any(k in d for k in ("target","end","dst"))
+        def is_node_dict(d):
+            return isinstance(d, dict) and any(k in d for k in ("id","name","label","labels","type","domain","role"))
+        def walk(x):
+            if isinstance(x, dict):
+                if is_edge_dict(x): edges.append(x)
+                elif is_node_dict(x): nodes.append(x)
+                for v in x.values(): walk(v)
+            elif isinstance(x, (list, tuple)):
+                for v in x: walk(v)
+        walk(obj)
+        def get_src(d): return d.get("source", d.get("start", d.get("src")))
+        def get_dst(d): return d.get("target", d.get("end",   d.get("dst")))
+        if not nodes and edges:
+            tmp = {}
+            for e in edges:
+                for nid in (get_src(e), get_dst(e)):
+                    if nid is None: continue
+                    tmp[str(nid)] = {"id": str(nid)}
+            nodes = list(tmp.values())
+        E2 = []
+        for e in edges:
+            src = e.get("source", e.get("start", e.get("src")))
+            dst = e.get("target", e.get("end",   e.get("dst")))
+            rname = e.get("type", e.get("label", e.get("relation","rel")))
+            if src is None or dst is None: continue
+            E2.append((str(src), str(dst), str(rname)))
+        edges = E2
+
+    # 인덱싱
+    node_ids = []
+    for e in nodes:
+        nid = e.get("id", e.get("name"))
+        if nid is not None: node_ids.append(str(nid))
+    for (u,v,_) in edges:
+        node_ids += [u, v]
+    node_ids = list(dict.fromkeys(node_ids))
+    id2idx = {nid:i for i, nid in enumerate(node_ids)}
+    N = len(id2idx)
+
+    # 원본 identity 리스트(idx → 원본 id)
+    idx2orig_id = []
+    for nid in node_ids:
+        # nid가 숫자 문자열이면 int 변환, 아니라면 elementId에서 마지막 토큰 시도
+        try:
+            idx2orig_id.append(int(nid))
+        except:
+            idx2orig_id.append(_parse_identity_from_elementId(nid))
+
+    node_domain = torch.full((N,), -1, dtype=torch.long)
+    node_role   = torch.full((N,), -1, dtype=torch.long)
+    names = [""]*N
+    labels_raw_per_idx = [None]*N  # 원본 라벨 보존
+
+    for e in nodes:
+        nid = e.get("id", e.get("name"))
+        if nid is None: continue
+        i = id2idx[str(nid)]
+        names[i] = e.get("name", str(nid))
+
+        raw_labels = e.get("labels", []) or e.get("label") or e.get("type") or ""
+        labels_raw_per_idx[i] = raw_labels
+
+        dom = e.get("domain", -1); role = e.get("role", -1)
+        if dom < 0 or role < 0:
+            d2, r2 = parse_domain_role_from_labels(raw_labels)
+            if dom  < 0 and d2>=0: dom  = d2
+            if role < 0 and r2>=0: role = r2
+        node_domain[i] = dom; node_role[i] = role
+
+    # 관계 id 매핑
+    rel2id = {}
+    for _,_,r in edges:
+        if r not in rel2id: rel2id[r] = len(rel2id)
+    num_rel = len(rel2id)
+
+    # 양방향 edge_index / edge_type
+    f_src, f_dst, f_type = [], [], []
+    b_src, b_dst, b_type = [], [], []
+    for (u_id, v_id, rname) in edges:
+        if u_id not in id2idx or v_id not in id2idx: continue
+        u = id2idx[u_id]; v = id2idx[v_id]; rid = rel2id[rname]
+        f_src.append(u); f_dst.append(v); f_type.append(rid)
+        b_src.append(v); b_dst.append(u); b_type.append(rid + num_rel)
+
+    edge_index = torch.tensor([f_src + b_src, f_dst + b_dst], dtype=torch.long) if (f_src or b_src) else torch.zeros((2,0), dtype=torch.long)
+    edge_type  = torch.tensor(f_type + b_type, dtype=torch.long) if (f_type or b_type) else torch.zeros((0,), dtype=torch.long)
+
+    data = SimpleNamespace(
+        num_nodes=len(id2idx),
+        names=names,
+        edge_index=edge_index,
+        edge_type=edge_type,
+        node_domain=node_domain,
+        node_role=node_role,
+        num_rel=num_rel,
+        labels_raw=labels_raw_per_idx,  # 감사/검증용
+        idx2orig_id=idx2orig_id        # ✅ 내부 idx → 원본 identity
+    )
+    meta = SimpleNamespace(rel2id=rel2id)
+    print(f"[Loader] nodes={data.num_nodes}, edges(undirected)={edge_index.size(1)//2}, #rel={num_rel}")
+    return data, meta
+
+def build_subgraph(data, keep_domains: set):
+    dom = data.node_domain
+    N = data.num_nodes
+    keep = torch.tensor([ (d.item() in keep_domains) for d in dom ], dtype=torch.bool)
+    old2new = -torch.ones(N, dtype=torch.long)
+    kept_idx = torch.nonzero(keep, as_tuple=False).view(-1)
+    for new_i, old_i in enumerate(kept_idx.tolist()):
+        old2new[old_i] = new_i
+    newN = kept_idx.numel()
+
+    E = data.edge_index.size(1); Eh = E//2
+    ei_f = data.edge_index[:, :Eh]; et_f = data.edge_type[:Eh]
+    ei_b = data.edge_index[:, Eh:]; et_b = data.edge_type[Eh:]
+
+    def filt(ei, et):
+        s, t = ei[0], ei[1]
+        m = keep[s] & keep[t]
+        s2 = old2new[s[m]]; t2 = old2new[t[m]]
+        et2 = et[m]
+        return torch.stack([s2, t2], dim=0), et2
+
+    ei_f2, et_f2 = filt(ei_f, et_f); ei_b2, et_b2 = filt(ei_b, et_b)
+    edge_index = torch.cat([ei_f2, ei_b2], dim=1)
+    edge_type  = torch.cat([et_f2, et_b2], dim=0)
+
+    # ✅ labels_raw / names / idx2orig_id 전달
+    labels_raw = [data.labels_raw[i] for i in kept_idx.tolist()] if hasattr(data, "labels_raw") and data.labels_raw is not None else None
+    names      = [data.names[i] for i in kept_idx.tolist()] if hasattr(data, "names") and data.names is not None else None
+    idx2orig   = [data.idx2orig_id[i] for i in kept_idx.tolist()] if hasattr(data, "idx2orig_id") and data.idx2orig_id is not None else None
+
+    return SimpleNamespace(
+        num_nodes=newN,
+        edge_index=edge_index,
+        edge_type=edge_type,
+        node_domain=data.node_domain[keep],
+        node_role=data.node_role[keep],
+        num_rel=data.num_rel,
+        labels_raw=labels_raw,
+        names=names,
+        idx2orig_id=idx2orig
+    )
+
+def filter_edges_by_domain_pairs(edge_index, node_domain: torch.Tensor, keep_pairs: set):
+    s, t = edge_index[0], edge_index[1]
+    if node_domain.device != s.device:
+        node_domain = node_domain.to(s.device)
+    ds, dt = node_domain[s], node_domain[t]
+    m = torch.zeros(s.size(0), dtype=torch.bool, device=s.device)
+    for (a, b) in keep_pairs:
+        m |= ((ds == a) & (dt == b))
+    return m
+
+from model.compgcn_conv import CompGCNConv  # 원본 CompGCN 레이어 사용
+
+class CompRGCNEncoder(nn.Module):
+    def __init__(self, num_ent, num_rel, init_dim=64, gcn_dim=128, embed_dim=64,
+                 dropout=0.1, opn='corr', bias=True, gcn_layers=2):
+        super().__init__()
+        self.num_ent = num_ent
+        self.num_rel = num_rel
+        self.init_emb = nn.Parameter(torch.randn(num_ent, init_dim))
+        self.init_rel = nn.Parameter(torch.randn(num_rel * 2, init_dim))  # 양방향
+        self.p = SimpleNamespace(
+            dropout=dropout, opn=opn, bias=bias, num_bases=0, gcn_layer=gcn_layers,
+            embed_dim=embed_dim, init_dim=init_dim, gcn_dim=gcn_dim, num_ent=num_ent, num_rel=num_rel
+        )
+        self.conv1 = CompGCNConv(init_dim, gcn_dim, num_rel, act=torch.tanh, params=self.p)
+        self.drop1 = nn.Dropout(dropout)
+        self.conv2 = CompGCNConv(gcn_dim, embed_dim, num_rel, act=torch.tanh, params=self.p) if gcn_layers==2 else None
+        self.drop2 = nn.Dropout(dropout)
+        self.register_parameter('bias', Parameter(torch.zeros(num_ent)))
+
+    def forward(self, edge_index, edge_type):
+        x = self.init_emb
+        x, r = self.conv1(x, edge_index, edge_type, rel_embed=self.init_rel)
+        x = self.drop1(x)
+        if self.conv2 is not None:
+            x, r = self.conv2(x, edge_index, edge_type, rel_embed=r)
+            x = self.drop2(x)
+        return x
+
+class GradReverse(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, lambd): ctx.lambd = lambd; return x.view_as(x)
+    @staticmethod
+    def backward(ctx, g): return g.neg() * ctx.lambd, None
+
+class GRL(nn.Module):
+    def __init__(self): super().__init__(); self._l=0.0
+    def set_lambda(self, l: float): self._l = float(l)
+    def forward(self, x): return GradReverse.apply(x, self._l)
+
+class PairClassifier(nn.Module):
+    def __init__(self, d, hidden=128, num_classes=2):
+        super().__init__()
+        self.fc = nn.Sequential(
+            nn.Linear(d*4, hidden), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(hidden, num_classes)
+        )
+    def forward(self, hu, hv):
+        z = torch.cat([hu, hv, (hu-hv).abs(), hu*hv], dim=-1)
+        return self.fc(z)
+
+def sample_pos_neg_edges(edge_index, num_nodes, num_neg=None, device=None):
+    if device is None: device = edge_index.device
+    E = edge_index.size(1); Eh = E//2
+    if Eh == 0: return None, None
+    pos = edge_index[:, :Eh]
+    if num_neg is None: num_neg = Eh
+    idx = torch.randint(0, Eh, (num_neg,), device=device)
+    neg_src = pos[0, idx]
+    neg_dst = torch.randint(0, num_nodes, (num_neg,), device=device)
+    neg = torch.stack([neg_src, neg_dst], dim=0)
+    return pos, neg
+
+def sample_neg_domain_matched(pos, node_domain: torch.Tensor, nodes_by_domain: dict,
+                              k: int, max_negs: int, device):
+    if pos is None or pos.size(1) == 0:
+        return None
+    P = pos.size(1)
+    num_neg = min(int(P * max(1,k)), max_negs)
+    k_eff = max(1, num_neg // P)
+
+    pos = pos.to(device)
+    node_domain = node_domain.to(device)
+    src_rep = pos[0].repeat_interleave(k_eff)
+    desired_t_dom = node_domain[pos[1]].repeat_interleave(k_eff)
+
+    neg_dst = torch.empty_like(src_rep)
+    for d, pool in nodes_by_domain.items():
+        pool = pool.to(device)
+        mask = (desired_t_dom == d)
+        m = int(mask.sum().item())
+        if m > 0:
+            idx = torch.randint(0, pool.size(0), (m,), device=device)
+            neg_dst[mask] = pool[idx]
+    return torch.stack([src_rep, neg_dst], dim=0)
+
+@torch.no_grad()
+def build_adj_sets(edge_index, num_nodes):
+    Eh = edge_index.size(1)//2
+    pos = edge_index[:, :Eh].cpu()
+    adj = [set() for _ in range(num_nodes)]
+    for u, v in zip(pos[0].tolist(), pos[1].tolist()):
+        adj[u].add(v)
+    return adj
+
+@torch.no_grad()
+def eval_link_metrics(H, edge_index, head: nn.Module,
+                      restrict_pairs: set=None, node_domain: torch.Tensor=None,
+                      sample_limit: int = 4096,
+                      nodes_by_domain: dict=None,
+                      domain_matched_neg: bool=True,
+                      return_best: bool=True):
+    """
+    분류 지표: ACC(0.5), balACC, AUC + (옵션) ACC@best, thr_best
+    평가 음성도 도메인 일치로 샘플(domain_matched_neg=True) 가능.
+    """
+    device = H.device
+    E = edge_index.size(1); Eh = E // 2
+    if Eh == 0:
+        z = torch.tensor(0.0, device=device)
+        out = {"bal_acc": z, "acc": z, "auc": torch.tensor(0.5, device=device)}
+        if return_best: out.update({"acc_best": z, "thr_best": 0.5})
+        return out
+
+    pos = edge_index[:, :Eh].to(device)
+    if restrict_pairs is not None and node_domain is not None:
+        m = filter_edges_by_domain_pairs(pos, node_domain, restrict_pairs)
+        pos = pos[:, m]
+        if pos.numel() == 0:
+            z = torch.tensor(0.0, device=device)
+            out = {"bal_acc": z, "acc": z, "auc": torch.tensor(0.5, device=device)}
+            if return_best: out.update({"acc_best": z, "thr_best": 0.5})
+            return out
+
+    P = pos.size(1)
+    if P > sample_limit:
+        idx = torch.randperm(P, device=device)[:sample_limit]
+        pos = pos[:, idx]; P = pos.size(1)
+
+    # --- 음성: 도메인 매칭(양성 tail과 같은 도메인에서 샘플) ---
+    if domain_matched_neg and (nodes_by_domain is not None) and (node_domain is not None):
+        ds = node_domain[pos[1]].to(device)  # 각 양성의 tail 도메인
+        neg_t = torch.empty_like(ds)
+        for d in ds.unique().tolist():
+            mask = (ds == d)
+            pool = nodes_by_domain.get(int(d), None)
+            if pool is None or pool.numel() == 0:
+                neg_t[mask] = torch.randint(0, H.size(0), (int(mask.sum().item()),), device=device)
+            else:
+                pool = pool.to(device)
+                ridx = torch.randint(0, pool.size(0), (int(mask.sum().item()),), device=device)
+                neg_t[mask] = pool[ridx]
+        neg = torch.stack([pos[0], neg_t], dim=0)
+    else:
+        idx_rand = torch.randint(0, H.size(0), (P,), device=device)
+        neg = torch.stack([pos[0], idx_rand], dim=0)
+
+    # 점수
+    s_pos = F.softmax(head(H[pos[0]], H[pos[1]]), dim=-1)[:, 1]
+    s_neg = F.softmax(head(H[neg[0]], H[neg[1]]), dim=-1)[:, 1]
+
+    # ACC(0.5) + balACC
+    acc_pos = (s_pos >= 0.5).float().mean()
+    acc_neg = (s_neg < 0.5).float().mean()
+    bal_acc = (acc_pos + acc_neg) / 2
+    acc = torch.cat([(s_pos >= 0.5).float(), (s_neg < 0.5).float()], dim=0).mean()
+
+    # AUC(순위 근사)
+    scores = torch.cat([s_pos, s_neg], dim=0)
+    labels = torch.cat([torch.ones_like(s_pos), torch.zeros_like(s_neg)], dim=0)
+    sorted_scores, order = torch.sort(scores)
+    ranks = torch.empty_like(order, dtype=torch.float); ranks[order] = torch.arange(1, scores.numel()+1, device=device, dtype=torch.float)
+    pos_ranks = ranks[labels == 1]
+    auc = (pos_ranks.sum() - (s_pos.numel() * (s_pos.numel() + 1) / 2)) / (s_pos.numel() * s_neg.numel() + 1e-12)
+
+    out = {"bal_acc": bal_acc, "acc": acc, "auc": auc}
+
+    # --- 최적 임계값 ACC ---
+    if return_best:
+        thr_grid = torch.linspace(0.05, 0.95, steps=19, device=device)
+        accs = []
+        for th in thr_grid:
+            acc_pos_th = (s_pos >= th).float().mean()
+            acc_neg_th = (s_neg <  th).float().mean()
+            accs.append((acc_pos_th + acc_neg_th)/2)
+        accs = torch.stack(accs)
+        best_idx = torch.argmax(accs)
+        out["acc_best"] = accs[best_idx]
+        out["thr_best"] = float(thr_grid[best_idx].item())
+
+    return out
+
+@torch.no_grad()
+def eval_ranking_metrics(H, edge_index, head: nn.Module, node_domain: torch.Tensor,
+                         restrict_pairs: set, nodes_by_domain: dict, adj_sets: list,
+                         sample_queries: int = 1000, filtered: bool = True,
+                         batch_size: int = 4096):
+    """
+    후보군: tail 도메인 일치
+    필터드: u의 다른 실제 이웃 제거 (v_true 제외)
+    반환: H@10
+    """
+    device = H.device
+    Eh = edge_index.size(1)//2
+    if Eh == 0:
+        z = torch.tensor(0.0, device=device)
+        return {"hits@10": z}
+    pos = edge_index[:, :Eh].to(device)
+    m = filter_edges_by_domain_pairs(pos, node_domain, restrict_pairs)
+    pos = pos[:, m]
+    P = pos.size(1)
+    if P == 0:
+        z = torch.tensor(0.0, device=device)
+        return {"hits@10": z}
+    if P > sample_queries:
+        idx = torch.randperm(P, device=device)[:sample_queries]
+        pos = pos[:, idx]; P = pos.size(1)
+
+    hit10 = 0
+    for j in range(P):
+        u = pos[0, j].item()
+        v_true = pos[1, j].item()
+        dt = int(node_domain[v_true].item())
+        cands = nodes_by_domain.get(dt, None)
+        if cands is None or cands.numel() == 0:
+            continue
+        cands = cands.to(device)
+        # 필터드 랭킹
+        if filtered and len(adj_sets[u]) > 0:
+            bad = torch.tensor([v for v in adj_sets[u] if v != v_true], device=device, dtype=torch.long)
+            if bad.numel() > 0:
+                keep_mask = torch.ones(cands.size(0), dtype=torch.bool, device=device)
+                keep_mask[torch.isin(cands, bad)] = False
+                keep_mask = keep_mask | (cands == v_true)
+                cands = cands[keep_mask]
+                if cands.numel() == 0:  # 모두 제거되면 스킵
+                    continue
+        # 스코어 & 랭크
+        hu = H[u].unsqueeze(0).expand(cands.size(0), -1)
+        scores = []
+        for st in range(0, cands.size(0), batch_size):
+            ed = min(st+batch_size, cands.size(0))
+            s_batch = F.softmax(head(hu[st:ed], H[cands[st:ed]]), dim=-1)[:, 1]
+            scores.append(s_batch)
+        scores = torch.cat(scores, dim=0)
+        s_true = scores[cands == v_true][0]
+        rank = 1 + (scores > s_true).sum().item()
+        if rank <= 10: hit10 += 1
+    h10 = torch.tensor(hit10/float(P), device=device)
+    return {"hits@10": h10}
+
+@torch.no_grad()
+def _false_neg_mask_by_adj(pos, neg, adj_sets, batch=65536):
+    """
+    (u, v_neg)가 실제 양성(=adj_sets[u]에 v_neg 존재)이면 True로 표시.
+    성능/메모리 절충을 위해 배치로 membership 검사.
+    """
+    if adj_sets is None:  # 제공 안되면 필터 스킵
+        return torch.zeros(neg.size(1), dtype=torch.bool, device=neg.device)
+    M = neg.size(1)
+    mask = torch.zeros(M, dtype=torch.bool, device=neg.device)
+    for st in range(0, M, batch):
+        ed = min(st+batch, M)
+        u = neg[0, st:ed].tolist()
+        v = neg[1, st:ed].tolist()
+        for i, uu in enumerate(u):
+            if v[i] in adj_sets[uu]:
+                mask[st+i] = True
+    return mask
+
+@torch.no_grad()
+def select_hard_negatives(pos, neg_pool, H, head, adj_sets=None,
+                          strategy="topk", topk_per_pos=1,
+                          semi_low=0.4, semi_high=0.7):
+    """
+    pos : [2, P]
+    neg_pool : [2, P * k_eff]  (pos별로 k_eff개씩 이어붙은 형태)
+    반환: [2, P * chosen_per_pos] 의 하드 음성만 (순서 유지 X)
+    """
+    device = H.device
+    P = pos.size(1)
+    if P == 0 or neg_pool is None or neg_pool.size(1) == 0:
+        return neg_pool
+
+    k_eff = max(1, neg_pool.size(1) // P)  # 각 pos당 후보 수
+    # 점수 계산: p(y=1 | neg)
+    s_neg = []
+    # 큰 풀일 때 메모리 절약
+    step = 131072
+    for st in range(0, neg_pool.size(1), step):
+        ed = min(st+step, neg_pool.size(1))
+        batch_s = F.softmax(head(H[neg_pool[0, st:ed]], H[neg_pool[1, st:ed]]), dim=-1)[:, 1]
+        s_neg.append(batch_s)
+    s_neg = torch.cat(s_neg, dim=0)  # [M]
+
+    # False negative 배제: 스코어 -inf 처리
+    if adj_sets is not None:
+        fn_mask = _false_neg_mask_by_adj(pos, neg_pool, adj_sets)
+        s_neg = s_neg.masked_fill(fn_mask, float("-inf"))
+
+    # pos별로 나눠서 상위 선택
+    s_neg = s_neg.view(P, k_eff)
+    neg_pool_u = neg_pool[0].view(P, k_eff)
+    neg_pool_v = neg_pool[1].view(P, k_eff)
+
+    if strategy == "topk":
+        k = min(topk_per_pos, k_eff)
+        vals, idx = torch.topk(s_neg, k=k, dim=1, largest=True, sorted=False)
+        rows = torch.arange(P, device=device).unsqueeze(1).expand_as(idx)
+        hard_u = neg_pool_u[rows, idx].reshape(-1)
+        hard_v = neg_pool_v[rows, idx].reshape(-1)
+        return torch.stack([hard_u, hard_v], dim=0)
+
+    elif strategy == "semi":
+        # 중간 난이도만 남기고, pos마다 개수 맞춰 샘플링
+        keep = (s_neg >= semi_low) & (s_neg <= semi_high)
+        hard_u_list, hard_v_list = []
+        for i in range(P):
+            cand_u = neg_pool_u[i][keep[i]]
+            cand_v = neg_pool_v[i][keep[i]]
+            if cand_u.numel() == 0:  # 없으면 상위로 fallback
+                # 상위 1개라도 확보
+                top_idx = torch.argmax(s_neg[i])
+                cand_u = neg_pool_u[i][top_idx:top_idx+1]
+                cand_v = neg_pool_v[i][top_idx:top_idx+1]
+            # 원하는 개수만큼 샘플
+            if cand_u.numel() > topk_per_pos:
+                ridx = torch.randperm(cand_u.numel(), device=device)[:topk_per_pos]
+                cand_u, cand_v = cand_u[ridx], cand_v[ridx]
+            hard_u_list.append(cand_u)
+            hard_v_list.append(cand_v)
+        hard_u = torch.cat(hard_u_list, dim=0)
+        hard_v = torch.cat(hard_v_list, dim=0)
+        return torch.stack([hard_u, hard_v], dim=0)
+
+    else:
+        # 알 수 없는 전략이면 그대로 반환
+        return neg_pool
+
+data, meta = load_graph_json(args.graph)
+print(f"Graph loaded: N={data.num_nodes}, E_undirected={data.edge_index.size(1)//2}, #rel={data.num_rel}")
+
+AI, MB, AE = 0, 1, 2
+src = build_subgraph(data, keep_domains={AI, MB})
+tgt = build_subgraph(data, keep_domains={AI, AE})
+
+print(f"Source(AI&MB) -> N={src.num_nodes}, E_half={src.edge_index.size(1)//2}")
+print(f"Target(AI&AE) -> N={tgt.num_nodes}, E_half={tgt.edge_index.size(1)//2}")
+
+# 도메인별 노드 인덱스 (네거티브/랭킹용)
+def build_nodes_by_domain(node_domain: torch.Tensor):
+    nodes_by_domain = {}
+    for d in node_domain.unique().tolist():
+        if d >= 0:
+            nodes_by_domain[d] = torch.nonzero(node_domain == d, as_tuple=False).view(-1)
+    return nodes_by_domain
+
+src.nodes_by_domain = build_nodes_by_domain(src.node_domain)
+tgt.nodes_by_domain = build_nodes_by_domain(tgt.node_domain)
+
+# Python 3.11+: getargspec 브리지 (model.message_passing에서 사용됨)
+import inspect as _inspect
+from collections import namedtuple
+if not hasattr(_inspect, "getargspec"):
+    ArgSpec = namedtuple('ArgSpec', 'args varargs keywords defaults')
+    def _getargspec(func):
+        fs = _inspect.getfullargspec(func)
+        return ArgSpec(fs.args, fs.varargs, fs.varkw, fs.defaults)
+    _inspect.getargspec = _getargspec
+print("✅ inspect.getargspec patched.")
+
+encoder = CompRGCNEncoder(
+    num_ent=max(src.num_nodes, tgt.num_nodes),
+    num_rel=data.num_rel,
+    init_dim=args.init_dim,
+    gcn_dim=args.gcn_dim,
+    embed_dim=args.encoder_dim,
+    dropout=args.dropout,
+    opn='corr', bias=True, gcn_layers=2
+).to(device)
+
+pair_head = PairClassifier(args.encoder_dim, hidden=128, num_classes=2).to(device)
+
+grl = GRL().to(device)
+domain_head = nn.Sequential(
+    grl,
+    nn.Linear(args.encoder_dim, 64), nn.ReLU(), nn.Dropout(0.1),
+    nn.Linear(64, 2)
+).to(device)
+
+optim = torch.optim.Adam(
+    list(encoder.parameters()) + list(pair_head.parameters()) + list(domain_head.parameters()),
+    lr=args.lr
+)
+
+# 도메인 페어
+keep_src_pairs = {(AI,AI), (AI,MB), (MB,MB), (MB,AI)}
+keep_tgt_pairs_inter = {(AI,AE), (AE,AI)}
+
+best_tgt = 0.0; best_src = 0.0; best_ep = 0
+current_epoch = 0
+patience_counter = 0
+stopped_early = False
+
+def count_params(m): return sum(p.numel() for p in m.parameters() if p.requires_grad)
+print(f"Encoder params: {count_params(encoder):,} | PairHead: {count_params(pair_head):,} | DomainHead: {count_params(domain_head):,}")
+
+# 랭킹용 adjacency (filtered ranking)
+adj_src = build_adj_sets(src.edge_index, src.num_nodes)
+adj_tgt = build_adj_sets(tgt.edge_index, tgt.num_nodes)
+print("✅ Adjacency sets ready for filtered ranking.")
+
+def train_for_epochs(num_epochs: int = 5):
+    """
+    - GRL/엔트로피 스케줄: 이번 조각 길이(num_epochs) 기준
+    - CE 가중치 토글(args.balance_ce, 기본 True)
+    - 로그: AUC/ACC/ACC@best/H@10 + P/N/neg_ratio
+    - early stopping 기준: 타깃 AUC
+    """
+    global current_epoch, best_tgt, best_src, best_ep, patience_counter, stopped_early
+    if stopped_early:
+        print("⏹ Already early-stopped. Reset counters to continue.")
+        return current_epoch, best_ep, best_src, best_tgt, True
+
+    for it in range(1, num_epochs + 1):
+        if current_epoch >= args.epochs:
+            print(f"⏹ Reached max epochs ({args.epochs}).")
+            stopped_early = True
+            break
+
+        current_epoch += 1               # 전역 에폭(누적)
+        ep_global = current_epoch
+        ep_local  = it                   # 이번 조각 내 에폭(1..num_epochs)
+
+        encoder.train(); pair_head.train(); domain_head.train()
+        optim.zero_grad()
+
+        # 🔸 스케줄: 이번 조각 내 진행률 기준
+        prog = ep_local / float(max(1, num_epochs))
+        lambd = min(prog, args.grl_lambda_max)
+        grl.set_lambda(lambd)
+        entw_now = prog * args.entropy_w
+
+        # 임베딩
+        Hs = encoder(src.edge_index.to(device), src.edge_type.to(device))
+        Ht = encoder(tgt.edge_index.to(device), tgt.edge_type.to(device))
+
+        # --- 소스: 양성 엣지 + 도메인 매칭 음성 ---
+        pos_all, _ = sample_pos_neg_edges(src.edge_index.to(device), src.num_nodes, device=device)
+        if pos_all is not None:
+            mpos = filter_edges_by_domain_pairs(pos_all, src.node_domain, keep_src_pairs)
+            pos = pos_all[:, mpos]
+        else:
+            pos = None
+
+        if pos is None or pos.size(1) == 0:
+            cls_loss = torch.tensor(0.0, device=device)
+            P = 0; N = 0
+        else:
+            # 양성
+            hu_pos, hv_pos = Hs[pos[0]], Hs[pos[1]]
+            log_pos = pair_head(hu_pos, hv_pos)
+            y_pos = torch.ones(log_pos.size(0), dtype=torch.long, device=device)
+            P = y_pos.numel()
+
+            # 음성(도메인 매칭, 비율 기반)
+            neg = sample_neg_domain_matched(
+                pos, src.node_domain, src.nodes_by_domain,
+                k=args.neg_ratio, max_negs=args.max_negs, device=device
+            )
+            hu_neg, hv_neg = Hs[neg[0]], Hs[neg[1]]
+            log_neg = pair_head(hu_neg, hv_neg)
+            y_neg = torch.zeros(log_neg.size(0), dtype=torch.long, device=device)
+            N = y_neg.numel()
+
+            logits = torch.cat([log_pos, log_neg], dim=0)
+            y = torch.cat([y_pos, y_neg], dim=0)
+
+            # 🔸 클래스 가중치 토글
+            if getattr(args, "balance_ce", True):
+                total = float(P + N) + 1e-12
+                w_neg = total / (2.0 * float(N) + 1e-12)
+                w_pos = total / (2.0 * float(P) + 1e-12)
+                weights = torch.tensor([w_neg, w_pos], device=device, dtype=torch.float)
+                cls_loss = F.cross_entropy(logits, y, weight=weights)
+            else:
+                cls_loss = F.cross_entropy(logits, y)
+
+        # --- 도메인 적대 ---
+        ds = domain_head(Hs); dt = domain_head(Ht)
+        y_ds = torch.zeros(ds.size(0), dtype=torch.long, device=device)
+        y_dt = torch.ones(dt.size(0),  dtype=torch.long, device=device)
+        grl_loss = F.cross_entropy(torch.cat([ds, dt], dim=0), torch.cat([y_ds, y_dt], dim=0))
+
+        # --- 타깃 엔트로피 (inter 전용) ---
+        Eh_t = tgt.edge_index.size(1)//2
+        if Eh_t > 0:
+            pos_t = tgt.edge_index[:, :Eh_t].to(device)
+            mask_inter = filter_edges_by_domain_pairs(pos_t, tgt.node_domain, keep_tgt_pairs_inter)
+            if mask_inter.any():
+                idx = torch.nonzero(mask_inter, as_tuple=False).view(-1)
+                if idx.numel() > 2048:
+                    idx = idx[torch.randperm(idx.numel(), device=device)[:2048]]
+            else:
+                idx = torch.randint(0, Eh_t, (min(2048, Eh_t),), device=device)
+            u_t = pos_t[0, idx]; v_t = pos_t[1, idx]
+            pt = F.softmax(pair_head(Ht[u_t], Ht[v_t]), dim=-1).clamp_min(1e-9)
+            ent_loss = -(pt * pt.log()).sum(dim=-1).mean()
+        else:
+            ent_loss = torch.tensor(0.0, device=device)
+
+        # L2(약하게)
+        reg = torch.tensor(0.0, device=device)
+        for m in [encoder, pair_head]:
+            for p in m.parameters():
+                if p.requires_grad and p.dim() > 1:
+                    reg = reg + 1e-4 * (p**2).mean()
+
+        loss = cls_loss + grl_loss + entw_now * ent_loss + reg
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(pair_head.parameters()), 5.0)
+        optim.step()
+
+        # --- eval (ACC/balACC + AUC + ACC@best + H@10) ---
+        encoder.eval(); pair_head.eval()
+        with torch.no_grad():
+            Hs_eval = encoder(src.edge_index.to(device), src.edge_type.to(device))
+            Ht_eval = encoder(tgt.edge_index.to(device), tgt.edge_type.to(device))
+            src_metrics = eval_link_metrics(
+                Hs_eval, src.edge_index.to(device), pair_head,
+                restrict_pairs=keep_src_pairs, node_domain=src.node_domain.to(device),
+                sample_limit=args.eval_sample_limit,
+                nodes_by_domain=src.nodes_by_domain,
+                domain_matched_neg=True, return_best=True
+            )
+            tgt_metrics = eval_link_metrics(
+                Ht_eval, tgt.edge_index.to(device), pair_head,
+                restrict_pairs=keep_tgt_pairs_inter, node_domain=tgt.node_domain.to(device),
+                sample_limit=args.eval_sample_limit,
+                nodes_by_domain=tgt.nodes_by_domain,
+                domain_matched_neg=True, return_best=True
+            )
+            # 랭킹(H@10만)
+            q_lim = min(args.rank_sample_queries, 256)
+            rank_src = eval_ranking_metrics(Hs_eval, src.edge_index.to(device), pair_head,
+                                            src.node_domain.to(device), keep_src_pairs,
+                                            src.nodes_by_domain, adj_src, sample_queries=q_lim)
+            rank_tgt = eval_ranking_metrics(Ht_eval, tgt.edge_index.to(device), pair_head,
+                                            tgt.node_domain.to(device), keep_tgt_pairs_inter,
+                                            tgt.nodes_by_domain, adj_tgt, sample_queries=q_lim)
+
+        if ep_global % args.print_every == 0:
+            print(f"[{ep_global:03d}] loss={loss.item():.4f} | "
+                  f"SRC balACC={src_metrics['bal_acc'].item():.4f} AUC={src_metrics['auc'].item():.4f} "
+                  f"ACC={src_metrics['acc'].item():.4f} ACC*={src_metrics['acc_best'].item():.4f}@{src_metrics['thr_best']:.2f} "
+                  f"H@10={rank_src['hits@10'].item():.4f} | "
+                  f"TGT balACC={tgt_metrics['bal_acc'].item():.4f} AUC={tgt_metrics['auc'].item():.4f} "
+                  f"ACC={tgt_metrics['acc'].item():.4f} ACC*={tgt_metrics['acc_best'].item():.4f}@{tgt_metrics['thr_best']:.2f} "
+                  f"H@10={rank_tgt['hits@10'].item():.4f} | "
+                  f"cls={cls_loss.item():.4f} grl={grl_loss.item():.4f} ent={ent_loss.item():.4f} "
+                  f"(λ={lambd:.3f}, P={P}, N={N}, neg_ratio={args.neg_ratio})")
+
+        # early stopping: 타깃 AUC 기준
+        tgt_score = tgt_metrics['auc'].item()
+        if tgt_score > best_tgt:
+            best_tgt = tgt_score; best_src = src_metrics['auc'].item(); best_ep = ep_global
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= args.patience:
+                print(f"⏹ Early stopping at epoch {ep_global} (no improvement for {args.patience}). "
+                      f"BEST TGT AUC={best_tgt:.4f} @ {best_ep}")
+                stopped_early = True
+                break
+
+    return current_epoch, best_ep, best_src, best_tgt, stopped_early
+
+print("✅ Training step ready. use: train_for_epochs(num_epochs=5)")
+
+ep, bep, bsrc, btgt, stopped = train_for_epochs(num_epochs=100)
+print(f"Progress: epoch={ep}, BEST@{bep}: SRC_AUC={bsrc:.4f}, TGT_AUC={btgt:.4f}, stopped={stopped}")
+
+import itertools
+
+def init_models_for_trial():
+    enc = CompRGCNEncoder(
+        num_ent=max(src.num_nodes, tgt.num_nodes),
+        num_rel=data.num_rel,
+        init_dim=args.init_dim,
+        gcn_dim=args.gcn_dim,
+        embed_dim=args.encoder_dim,
+        dropout=args.dropout,
+        opn='corr', bias=True, gcn_layers=2
+    ).to(device)
+    ph = PairClassifier(args.encoder_dim, hidden=128, num_classes=2).to(device)
+    gr = GRL().to(device)
+    dh = nn.Sequential(
+        gr,
+        nn.Linear(args.encoder_dim, 64), nn.ReLU(), nn.Dropout(0.1),
+        nn.Linear(64, 2)
+    ).to(device)
+    opt = torch.optim.Adam(list(enc.parameters()) + list(ph.parameters()) + list(dh.parameters()), lr=args.lr)
+    return enc, ph, gr, dh, opt
+
+def train_one_trial(neg_ratio, grl_lambda_max, entropy_w, max_epochs,
+                    keep_src_pairs_local, keep_tgt_pairs_local):
+    """
+    - 트라이얼 내부 스케줄: ep/max_epochs 기반
+    - 평가: TGT/SRC 모두 AUC + ACC@best (임계값 탐색)
+    - early stopping: TGT AUC 기준
+    - CE 가중치 토글(args.balance_ce)
+    """
+    best_tgt_auc = 0.0; best_tgt_acc = 0.0
+    best_src_auc = 0.0; best_src_acc = 0.0
+    best_ep = 0
+    patience_counter_local = 0
+
+    encoder_l, pair_head_l, grl_l, domain_head_l, optim_l = init_models_for_trial()
+
+    for ep in range(1, max_epochs+1):
+        encoder_l.train(); pair_head_l.train(); domain_head_l.train()
+        optim_l.zero_grad()
+
+        # 🔸 스케줄: 트라이얼 길이 기준
+        prog = ep / float(max_epochs)
+        lambd = min(prog, grl_lambda_max)
+        grl_l.set_lambda(lambd)
+        entw_now = prog * entropy_w
+
+        # 임베딩
+        Hs = encoder_l(src.edge_index.to(device), src.edge_type.to(device))
+        Ht = encoder_l(tgt.edge_index.to(device), tgt.edge_type.to(device))
+
+        # 소스 CE
+        pos_all, _ = sample_pos_neg_edges(src.edge_index.to(device), src.num_nodes, device=device)
+        if pos_all is not None:
+            mpos = filter_edges_by_domain_pairs(pos_all, src.node_domain, keep_src_pairs_local)
+            pos = pos_all[:, mpos]
+        else:
+            pos = None
+
+        if pos is None or pos.size(1) == 0:
+            cls_loss = torch.tensor(0.0, device=device)
+        else:
+            hu_pos, hv_pos = Hs[pos[0]], Hs[pos[1]]
+            log_pos = pair_head_l(hu_pos, hv_pos)
+            y_pos = torch.ones(log_pos.size(0), dtype=torch.long, device=device)
+
+            neg = sample_neg_domain_matched(pos, src.node_domain, src.nodes_by_domain,
+                                            k=neg_ratio, max_negs=args.max_negs, device=device)
+            hu_neg, hv_neg = Hs[neg[0]], Hs[neg[1]]
+            log_neg = pair_head_l(hu_neg, hv_neg)
+            y_neg = torch.zeros(log_neg.size(0), dtype=torch.long, device=device)
+
+            logits = torch.cat([log_pos, log_neg], dim=0)
+            y = torch.cat([y_pos, y_neg], dim=0)
+
+            if getattr(args, "balance_ce", True):
+                P, N = y_pos.numel(), y_neg.numel()
+                total = float(P + N) + 1e-12
+                w_neg = total / (2.0 * float(N) + 1e-12)
+                w_pos = total / (2.0 * float(P) + 1e-12)
+                weights = torch.tensor([w_neg, w_pos], device=device, dtype=torch.float)
+                cls_loss = F.cross_entropy(logits, y, weight=weights)
+            else:
+                cls_loss = F.cross_entropy(logits, y)
+
+        # GRL
+        ds = domain_head_l(Hs); dt = domain_head_l(Ht)
+        y_ds = torch.zeros(ds.size(0), dtype=torch.long, device=device)
+        y_dt = torch.ones(dt.size(0),  dtype=torch.long, device=device)
+        grl_loss = F.cross_entropy(torch.cat([ds, dt], dim=0), torch.cat([y_ds, y_dt], dim=0))
+
+        # 타깃 엔트로피
+        Eh_t = tgt.edge_index.size(1)//2
+        if Eh_t > 0:
+            pos_t = tgt.edge_index[:, :Eh_t].to(device)
+            mask_inter = filter_edges_by_domain_pairs(pos_t, tgt.node_domain, keep_tgt_pairs_local)
+            if mask_inter.any():
+                idx = torch.nonzero(mask_inter, as_tuple=False).view(-1)
+                if idx.numel() > 2048:
+                    idx = idx[torch.randperm(idx.numel(), device=device)[:2048]]
+            else:
+                idx = torch.randint(0, Eh_t, (min(2048, Eh_t),), device=device)
+            u_t = pos_t[0, idx]; v_t = pos_t[1, idx]
+            pt = F.softmax(pair_head_l(Ht[u_t], Ht[v_t]), dim=-1).clamp_min(1e-9)
+            ent_loss = -(pt * pt.log()).sum(dim=-1).mean()
+        else:
+            ent_loss = torch.tensor(0.0, device=device)
+
+        # L2
+        reg = torch.tensor(0.0, device=device)
+        for m in [encoder_l, pair_head_l]:
+            for p in m.parameters():
+                if p.requires_grad and p.dim() > 1:
+                    reg = reg + 1e-4 * (p**2).mean()
+
+        loss = cls_loss + grl_loss + entw_now * ent_loss + reg
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(encoder_l.parameters()) + list(pair_head_l.parameters()), 5.0)
+        optim_l.step()
+
+# 평가: TGT + SRC (AUC, ACC@best)
+        encoder_l.eval(); pair_head_l.eval()
+        with torch.no_grad():
+            Hs_eval = encoder_l(src.edge_index.to(device), src.edge_type.to(device))
+            Ht_eval = encoder_l(tgt.edge_index.to(device), tgt.edge_type.to(device))
+
+            src_metrics = eval_link_metrics(
+                Hs_eval, src.edge_index.to(device), pair_head_l,
+                restrict_pairs=keep_src_pairs_local, node_domain=src.node_domain.to(device),
+                sample_limit=args.eval_sample_limit,
+                nodes_by_domain=src.nodes_by_domain,
+                domain_matched_neg=True, return_best=True
+            )
+            tgt_metrics = eval_link_metrics(
+                Ht_eval, tgt.edge_index.to(device), pair_head_l,
+                restrict_pairs=keep_tgt_pairs_local, node_domain=tgt.node_domain.to(device),
+                sample_limit=args.eval_sample_limit,
+                nodes_by_domain=tgt.nodes_by_domain,
+                domain_matched_neg=True, return_best=True
+            )
+
+        # early stopping: TGT AUC
+        score_auc_t = tgt_metrics['auc'].item()
+        if score_auc_t > best_tgt_auc:
+            best_tgt_auc = score_auc_t
+            best_tgt_acc = tgt_metrics['acc_best'].item()
+            best_src_auc = src_metrics['auc'].item()
+            best_src_acc = src_metrics['acc_best'].item()
+            best_ep = ep
+            patience_counter_local = 0
+        else:
+            patience_counter_local += 1
+            if patience_counter_local >= args.patience:
+                break
+
+    return {
+        "best_ep": best_ep,
+        "tgt_auc": best_tgt_auc,
+        "tgt_acc": best_tgt_acc,  # ACC@best
+        "src_auc": best_src_auc,
+        "src_acc": best_src_acc,  # ACC@best
+        "neg_ratio": neg_ratio,
+        "grl_lambda_max": grl_lambda_max,
+        "entropy_w": entropy_w,
+    }
+
+def run_grid_search():
+    combos = list(itertools.product(args.search_neg_ratio,
+                                    args.search_grl_lambda,
+                                    args.search_entropy_w))
+    keep_src = {(0,0),(0,1),(1,1),(1,0)}   # AI/Bio 내·교차
+    keep_tgt = {(0,2),(2,0)}               # AI<->Manu 교차
+
+    results = []
+    print(f"Grid-like search over {len(combos)} combos:")
+    for i, (nr, gl, ew) in enumerate(combos, 1):
+        # 🔸 트라이얼마다 시드 변경 (초기화/샘플링 다양화)
+        set_seed(args.seed + i * 1000)
+
+        res = train_one_trial(nr, gl, ew, max_epochs=args.gs_epochs_per_trial,
+                              keep_src_pairs_local=keep_src,
+                              keep_tgt_pairs_local=keep_tgt)
+        results.append(res)
+        print(f"[{i:02d}/{len(combos)}] neg={nr}, grl={gl}, ent={ew} "
+              f"--> BEST@{res['best_ep']:02d}  "
+              f"TGT AUC={res['tgt_auc']:.4f}  ACC*@best={res['tgt_acc']:.4f} | "
+              f"SRC AUC={res['src_auc']:.4f}  ACC*@best={res['src_acc']:.4f}")
+
+    # 정렬 및 요약(기본: 타깃 기준)
+    results.sort(key=lambda x: (x['tgt_auc'], x['tgt_acc']), reverse=True)
+    print("\n=== Top results (sorted by TGT) ===")
+    for k, r in enumerate(results[:5], 1):
+        print(f"#{k}: neg={r['neg_ratio']}, grl={r['grl_lambda_max']}, ent={r['entropy_w']} "
+              f"| BEST@{r['best_ep']} | "
+              f"TGT AUC={r['tgt_auc']:.4f} ACC*={r['tgt_acc']:.4f} | "
+              f"SRC AUC={r['src_auc']:.4f} ACC*={r['src_acc']:.4f}")
+    return results
+
+print("✅ Grid-like search ready.  사용법: results = run_grid_search()")
+
+results = run_grid_search()
+
+import pandas as pd
+
+@torch.no_grad()
+def sample_neg_pairs(pos_uv: torch.Tensor,
+                     node_domain: torch.Tensor,
+                     nodes_by_domain: dict,
+                     k: int,
+                     device):
+    if pos_uv is None or pos_uv.numel() == 0 or k <= 0:
+        return None
+    pos_uv = pos_uv.to(device=device, dtype=torch.long).contiguous()
+    nd = node_domain.to(device=device, dtype=torch.long)
+    P = pos_uv.size(1)
+    u_rep = pos_uv[0].repeat_interleave(k)
+    v_dom = nd[pos_uv[1]].repeat_interleave(k)
+    v_neg = torch.empty_like(u_rep, dtype=torch.long, device=device)
+
+    for d in v_dom.unique().tolist():
+        d_int = int(d)
+        mask = (v_dom == d_int)
+        count = int(mask.sum().item())
+        pool = nodes_by_domain.get(d_int, None)
+        if pool is None or (isinstance(pool, torch.Tensor) and pool.numel() == 0):
+            v_neg[mask] = torch.randint(0, int(nd.size(0)), (count,), device=device)
+        else:
+            pool_dev = pool.to(device=device, dtype=torch.long)
+            ridx = torch.randint(0, pool_dev.size(0), (count,), device=device)
+            v_neg[mask] = pool_dev[ridx]
+
+    return torch.stack([u_rep, v_neg], dim=0)
+
+class JointHead(nn.Module):
+    # 출력 차원: 0 = No_Link, 1..R = 관계 타입
+    def __init__(self, dim, hidden, num_rel):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(4*dim, hidden), nn.ReLU(), nn.Dropout(0.1),
+            nn.Linear(hidden, num_rel+1)
+        )
+    def forward(self, hu, hv):
+        z = torch.cat([hu, hv, (hu-hv).abs(), hu*hv], dim=-1)
+        return self.net(z)
+
+try:
+    joint_head
+except NameError:
+    joint_head = JointHead(dim=args.encoder_dim, hidden=128, num_rel=data.num_rel).to(device)
+    optim.add_param_group({'params': joint_head.parameters()})
+
+def joint_batch_loss(H, edge_index, edge_type, head,
+                     node_domain, nodes_by_domain,
+                     restrict_pairs, neg_ratio, device):
+    edge_index = edge_index.to(device=device, dtype=torch.long).contiguous()
+    edge_type  = edge_type.to(device=device, dtype=torch.long).contiguous()
+    nd = node_domain.to(device=device, dtype=torch.long)
+
+    Eh = edge_index.size(1)//2
+    pos_uv = edge_index[:, :Eh]
+    pos_r  = edge_type[:Eh]
+
+    s, t = pos_uv[0], pos_uv[1]
+    ds, dt = nd[s], nd[t]
+    mask = torch.zeros(Eh, dtype=torch.bool, device=device)
+    for (a,b) in restrict_pairs:
+        mask |= ((ds == a) & (dt == b))
+    pos_uv, pos_r = pos_uv[:, mask], pos_r[mask]
+    P = pos_uv.size(1)
+    if P == 0:
+        return torch.tensor(0.0, device=device, requires_grad=True)
+
+    # positive: 라벨 1..R
+    hu_pos, hv_pos = H[pos_uv[0]], H[pos_uv[1]]
+    logits_pos = head(hu_pos, hv_pos)
+    y_pos = pos_r + 1
+
+    # negative: 라벨 0
+    neg_uv = sample_neg_pairs(pos_uv, node_domain, nodes_by_domain, k=int(neg_ratio), device=device)
+    hu_neg, hv_neg = H[neg_uv[0]], H[neg_uv[1]]
+    logits_neg = head(hu_neg, hv_neg)
+    y_neg = torch.zeros(logits_neg.size(0), dtype=torch.long, device=device)
+
+    logits = torch.cat([logits_pos, logits_neg], dim=0)
+    labels = torch.cat([y_pos, y_neg], dim=0)
+    return F.cross_entropy(logits, labels)
+
+AI,MB,AE = 0,1,2
+keep_src_pairs = {(AI,AI),(AI,MB),(MB,AI),(MB,MB)}
+JOINT_NEG_RATIO_TRAIN = 10
+
+def train_stage1_joint(epochs=50):
+    encoder.train(); joint_head.train()
+    for ep in range(1, epochs+1):
+        optim.zero_grad()
+        Hs = encoder(src.edge_index.to(device), src.edge_type.to(device))
+        loss = joint_batch_loss(Hs, src.edge_index, src.edge_type, joint_head,
+                                src.node_domain, src.nodes_by_domain,
+                                restrict_pairs=keep_src_pairs,
+                                neg_ratio=JOINT_NEG_RATIO_TRAIN, device=device)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(list(encoder.parameters())+list(joint_head.parameters()), 5.0)
+        optim.step()
+        if ep % 5 == 0:
+            print(f"[S1:{ep}] loss={loss.item():.4f}")
+
+train_stage1_joint()
+
+# ── 권장: 노트북 맨 위 셀에 추가해두면 단편화가 덜합니다 ──
+# import os; os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+# ↓ 필요에 따라 완화된 기본값(메모리 친화)
+STAGE2_EPOCHS             = 100
+STAGE2_PATIENCE           = 60
+JOINT_NEG_RATIO_STAGE2    = 7         # (기존 60 → 16) 음수 샘플 과다 시 OOM 발생 잦음
+GRL_MAX_STAGE2            = 0.2
+JOINT_NEG_RATIO_EVAL      = 7
+keep_tgt_pairs_inter      = {(AI, AE), (AE, AI)}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# utils: 그래프/텐서를 한 번만 device로 올리고 재사용
+# ───────────────────────────────────────────────────────────────────────────────
+def _to_device_graph(g, device):
+    # g.edge_index, g.edge_type, g.node_domain 등만 올리고 캐시
+    if getattr(g, "_on_device", None) == device:
+        return g
+    g.edge_index   = g.edge_index.to(device=device, dtype=torch.long).contiguous()
+    g.edge_type    = g.edge_type.to(device=device, dtype=torch.long).contiguous()
+    g.node_domain  = g.node_domain.to(device=device, dtype=torch.long)
+    # nodes_by_domain는 인덱스 모음일 수 있으니 CPU set/list로 유지해도 OK
+    g._on_device   = device
+    return g
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 메모리 최적화: 스트리밍 랭킹 (거대한 s_all 생성 안 함)
+# ───────────────────────────────────────────────────────────────────────────────
+@torch.inference_mode()
+def eval_ranking_metrics_mrr(
+    H, edge_index, head, node_domain, restrict_pairs, nodes_by_domain,
+    adj=None, sample_queries=300, filtered=True, batch_size=512, device=None
+):
+    # 링크존재 랭킹 지표 (참고용). 점수 = 1 - p(No_Link)
+    device = device or H.device
+    edge_index = edge_index.to(device=device, dtype=torch.long).contiguous()
+    nd = node_domain.to(device=device, dtype=torch.long)
+    Eh = edge_index.size(1) // 2
+    if Eh == 0:
+        z = torch.tensor(0.0, device=device)
+        return {'hits@10': z, 'mrr': z, 'queries': 0}
+
+    uv = edge_index[:, :Eh]
+    ds, dt = nd[uv[0]], nd[uv[1]]
+    mask = torch.zeros(Eh, dtype=torch.bool, device=device)
+    for (a, b) in restrict_pairs:
+        mask |= ((ds == a) & (dt == b))
+    uv = uv[:, mask]
+    P = uv.size(1)
+    if P == 0:
+        z = torch.tensor(0.0, device=device)
+        return {'hits@10': z, 'mrr': z, 'queries': 0}
+
+    if sample_queries and P > sample_queries:
+        idx = torch.randperm(P, device=device)[:sample_queries]
+        uv = uv[:, idx]
+    Q = int(uv.size(1))
+
+    # 필터링용 인접 사전 (CPU set)
+    py_adj = None
+    if filtered:
+        if isinstance(adj, dict):
+            py_adj = adj
+        else:
+            uv_cpu = uv.detach().cpu().numpy().T
+            py_adj = {}
+            for u_i, v_i in uv_cpu:
+                py_adj.setdefault(int(u_i), set()).add(int(v_i))
+
+    head.eval()
+    tot_rr = 0.0
+    tot_hits10 = 0.0
+
+    for i in range(Q):
+        u = int(uv[0, i].item())
+        v_true = int(uv[1, i].item())
+        t_dom = int(nd[v_true].item())
+
+        # 도메인 후보 풀 (CPU에서 필터링 후 GPU로 올리기)
+        pool_tensor = nodes_by_domain.get(t_dom, torch.nonzero(nd == t_dom, as_tuple=False).view(-1))
+        pool_list = pool_tensor.detach().cpu().tolist()
+
+        if filtered and py_adj is not None:
+            forbid = py_adj.get(u, set())
+            if v_true in forbid:
+                # true는 허용
+                forbid = set(forbid) - {v_true}
+            if forbid:
+                forbid = set(int(x) for x in forbid)
+                pool_list = [x for x in pool_list if x not in forbid]
+
+        if v_true not in pool_list:
+            pool_list.append(v_true)
+
+        pool = torch.tensor(pool_list, dtype=torch.long, device=device)
+
+        # s_true 한 번만 계산
+        hu = H[u].unsqueeze(0)
+        hv_true = H[v_true].unsqueeze(0)
+        logits_true = head(hu, hv_true)               # [1, C]
+        # log_softmax 사용: 수치안정 + 메모리 적음
+        logp_true = F.log_softmax(logits_true, dim=-1)
+        s_true = (1.0 - torch.exp(logp_true[:, 0]))   # 1 - p(No_Link), shape [1]
+        s_true_val = float(s_true.item())
+
+        num_greater = 0
+        # 스트리밍 비교: s_batch > s_true 만 세서 rank 계산
+        for st in range(0, pool.numel(), batch_size):
+            vs = pool[st: st + batch_size]
+            hv = H[vs]  # [B, d]
+            logits = head(hu.expand(vs.size(0), -1), hv)  # [B, C]
+            logp = F.log_softmax(logits, dim=-1)
+            s_batch = 1.0 - torch.exp(logp[:, 0])  # [B]
+            # v_true가 포함되어 있어도 > 비교이므로 자신은 카운트 안 됨
+            num_greater += int((s_batch > s_true_val).sum().item())
+
+        rank = 1 + num_greater
+        tot_rr += 1.0 / float(rank)
+        if rank <= 10:
+            tot_hits10 += 1.0
+
+    mrr = torch.tensor(tot_rr / float(Q), device=device)
+    hits10 = torch.tensor(tot_hits10 / float(Q), device=device)
+    return {'hits@10': hits10, 'mrr': mrr, 'queries': Q}
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 타입 랭킹 평가: 점수 행렬 CPU에 적재(큰 텐서가 GPU 상주하지 않도록)
+# ───────────────────────────────────────────────────────────────────────────────
+@torch.inference_mode()
+def eval_reltype_metrics_udagcn(encoder, joint_head, graph, num_rel, restrict_pairs,
+                                sample_limit=2048, batch=256, device=None):
+    device = device or next(encoder.parameters()).device
+    encoder.eval(); joint_head.eval()
+    edge_index = graph.edge_index.to(device=device, dtype=torch.long).contiguous()
+    edge_type  = graph.edge_type.to(device=device, dtype=torch.long).contiguous()
+    nd         = graph.node_domain.to(device=device, dtype=torch.long)
+    Eh = edge_index.size(1)//2
+    if Eh == 0:
+        z = torch.tensor(0.0, device=device)
+        return {"acc": z, "hits3": z, "hits10": z, "mrr": z, "macro_f1": z, "auc_macro": z, "n": 0}
+
+    uv = edge_index[:, :Eh]; r  = edge_type[:Eh]
+    ds, dt = nd[uv[0]], nd[uv[1]]
+    mask = torch.zeros(Eh, dtype=torch.bool, device=device)
+    for (a, b) in restrict_pairs:
+        mask |= ((ds == a) & (dt == b))
+    uv, r = uv[:, mask], r[mask]; P = uv.size(1)
+    if P == 0:
+        z = torch.tensor(0.0, device=device)
+        return {"acc": z, "hits3": z, "hits10": z, "mrr": z, "macro_f1": z, "auc_macro": z, "n": 0}
+
+    if P > sample_limit:
+        idx = torch.randperm(P, device=device)[:sample_limit]
+        uv = uv[:, idx]; r = r[idx]; P = int(uv.size(1))
+
+    # 임베딩 1회 계산 (AMP로 메모리/연산 절감)
+    with torch.cuda.amp.autocast():
+        H = encoder(edge_index, edge_type)
+
+    top1 = hit3 = hit10 = 0
+    rr_sum = 0.0
+
+    # 큰 행렬은 CPU에 저장
+    import math
+    scores_all_cpu = torch.empty((P, num_rel), dtype=torch.float32, device='cpu')
+    labels_all_cpu = r.detach().to('cpu')
+    out_row = 0
+
+    for st in range(0, P, batch):
+        ed = min(st + batch, P)
+        u = uv[0, st:ed]; v = uv[1, st:ed]; r_true = r[st:ed]; B = u.size(0)
+
+        with torch.cuda.amp.autocast():
+            logits_full = joint_head(H[u], H[v])              # [B, 1 + num_rel + (maybe others?)]
+            logits_rel = logits_full[:, 1:1+num_rel]          # No_Link 제외
+
+        # 순위 통계(메모리 적게): 배치 내부에서만 사용 후 버림
+        s_true = logits_rel.gather(1, r_true.view(-1, 1)).squeeze(1)  # [B]
+        ranks = 1 + (logits_rel > s_true.unsqueeze(1)).sum(dim=1)
+        top1  += int((ranks == 1).sum().item())
+        hit3  += int((ranks <= 3).sum().item())
+        hit10 += int((ranks <= 10).sum().item())
+        rr_sum += float((1.0 / ranks.float()).sum().item())
+
+        # CPU로 즉시 옮겨 저장
+        scores_all_cpu[out_row:out_row+B] = logits_rel.detach().to('cpu')
+        out_row += B
+
+        # GPU 메모리 정리
+        del logits_full, logits_rel, s_true, ranks
+        if (st // batch) % 8 == 0:
+            torch.cuda.empty_cache()
+
+    acc = torch.tensor(top1/float(P), device=device)
+    h3  = torch.tensor(hit3/float(P), device=device)
+    h10 = torch.tensor(hit10/float(P), device=device)
+    mrr = torch.tensor(rr_sum/float(P), device=device)
+
+    # 간단 AUC(랭크 근사) — CPU에서 계산
+    auc_sum = 0.0; auc_cnt = 0
+    preds = scores_all_cpu.argmax(dim=1)
+    uniq = labels_all_cpu.unique().tolist()
+    for c in uniq:
+        mask_pos = (labels_all_cpu == int(c))
+        n_pos = int(mask_pos.sum().item()); n_neg = P - n_pos
+        if n_pos == 0 or n_neg == 0:
+            continue
+        s = scores_all_cpu[:, int(c)]
+        sorted_s, order = torch.sort(s)
+        ranks = torch.empty_like(order, dtype=torch.float32)
+        ranks[order] = torch.arange(1, P+1, dtype=torch.float32)
+        pos_ranks = ranks[mask_pos]
+        auc_c = (pos_ranks.sum() - (n_pos*(n_pos+1)/2.0)) / max(1.0, (n_pos*n_neg))
+        auc_sum += float(auc_c.item()); auc_cnt += 1
+    auc_macro = torch.tensor(auc_sum / max(1, auc_cnt), device=device)
+
+    return {
+        "acc": acc, "hits3": h3, "hits10": h10, "mrr": mrr,
+        "macro_f1": torch.tensor(0.0, device=device),  # 필요시 F1 계산 루틴 추가
+        "auc_macro": auc_macro, "n": int(P)
+    }
+
+# ───────────────────────────────────────────────────────────────────────────────
+# Stage2 joint 훈련 (AMP + 빈번한 캐시 정리 + 중간평가 축소)
+# ───────────────────────────────────────────────────────────────────────────────
+def train_stage2_joint(epochs=STAGE2_EPOCHS, patience=STAGE2_PATIENCE,
+                       eval_every=5, eval_sample_queries=300, eval_batch_size=512,
+                       accum_steps=1):
+    global src, tgt, encoder, joint_head, optim, grl, device, keep_src_pairs, adj_tgt
+
+    # 그래프를 device로 올려놓고 재사용
+    _to_device_graph(src, device)
+    _to_device_graph(tgt, device)
+
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    best_auc, best_ep, no_improve = 0.0, 0, 0
+
+    encoder.train(); joint_head.train()
+    optim.zero_grad(set_to_none=True)
+
+    for ep in range(1, epochs + 1):
+        prog = ep / epochs
+        grl.set_lambda(min(GRL_MAX_STAGE2, GRL_MAX_STAGE2 * prog))
+
+        # ─ Training step (AMP + optional gradient accumulation) ─
+        with torch.cuda.amp.autocast():
+            # src 그래프 임베딩
+            Hs = encoder(src.edge_index, src.edge_type)
+
+            # tgt forward for GRL: 내부에 도메인 분류기가 붙어있다면 필요
+            # (메모리 압박 시 encoder 내부에서 노드/에지 샘플링을 지원한다면 mfg/cluster 등으로 소량만 통과 추천)
+            _ = encoder(tgt.edge_index, tgt.edge_type)
+
+            loss = joint_batch_loss(
+                Hs,
+                src.edge_index, src.edge_type,
+                joint_head,
+                src.node_domain, src.nodes_by_domain,
+                restrict_pairs=keep_src_pairs,
+                neg_ratio=JOINT_NEG_RATIO_STAGE2,
+                device=device
+            ) / accum_steps
+
+        scaler.scale(loss).backward()
+
+        if ep % accum_steps == 0:
+            # unscale + clip + step
+            scaler.unscale_(optim)
+            torch.nn.utils.clip_grad_norm_(list(encoder.parameters()) + list(joint_head.parameters()), 5.0)
+            scaler.step(optim)
+            scaler.update()
+            optim.zero_grad(set_to_none=True)
+
+        # 불필요 텐서 제거
+        del Hs, loss
+        if ep % 2 == 0:
+            torch.cuda.empty_cache()
+
+        # ─ 중간 평가 (메모리 친화 파라미터로) ─
+        if eval_every and (ep % eval_every == 0):
+            encoder.eval(); joint_head.eval()
+            with torch.no_grad(), torch.cuda.amp.autocast():
+                Ht_eval = encoder(tgt.edge_index, tgt.edge_type)
+            rank_tgt = eval_ranking_metrics_mrr(
+                Ht_eval, tgt.edge_index, joint_head,
+                tgt.node_domain, {(AI, AE), (AE, AI)}, tgt.nodes_by_domain, adj_tgt,
+                sample_queries=eval_sample_queries, filtered=True, batch_size=eval_batch_size, device=device
+            )
+            print(f"[S2:{ep:03d}] Link MRR={rank_tgt['mrr']:.4f} H@10={rank_tgt['hits@10']:.4f}")
+            del Ht_eval
+            encoder.train(); joint_head.train()
+            torch.cuda.empty_cache()
+
+    print("✅ Stage2 done.")
+
+train_stage2_joint()
+
+@torch.no_grad()
+def eval_joint_reltype_with_nolink(
+    encoder, joint_head, graph, num_rel, restrict_pairs,
+    neg_ratio_eval=10, sample_limit_pos=4096, sample_limit_neg=None, batch=2048, device=None
+):
+    if device is None: device = next(encoder.parameters()).device
+    encoder.eval(); joint_head.eval()
+
+    edge_index = graph.edge_index.to(device=device, dtype=torch.long).contiguous()
+    edge_type  = graph.edge_type.to(device=device, dtype=torch.long).contiguous()
+    nd         = graph.node_domain.to(device=device, dtype=torch.long)
+
+    Eh = edge_index.size(1)//2
+    if Eh == 0:
+        z = torch.tensor(0.0, device=device); C = num_rel+1
+        return {"acc": z, "auc_macro": z, "mrr": z, "hits10": z,
+                "micro_f1": z, "macro_f1": z, "weighted_f1": z,
+                "per_class_f1": torch.zeros(C, device=device), "n_pos": 0, "n_neg": 0}
+
+    uv_pos = edge_index[:, :Eh]; r_pos = edge_type[:Eh]
+    ds, dt = nd[uv_pos[0]], nd[uv_pos[1]]
+    mask = torch.zeros(Eh, dtype=torch.bool, device=device)
+    for (a,b) in restrict_pairs: mask |= ((ds==a) & (dt==b))
+    uv_pos, r_pos = uv_pos[:, mask], r_pos[mask]
+    P = int(uv_pos.size(1))
+    if P == 0:
+        z = torch.tensor(0.0, device=device); C = num_rel+1
+        return {"acc": z, "auc_macro": z, "mrr": z, "hits10": z,
+                "micro_f1": z, "macro_f1": z, "weighted_f1": z,
+                "per_class_f1": torch.zeros(C, device=device), "n_pos": 0, "n_neg": 0}
+
+    if P > sample_limit_pos:
+        idx = torch.randperm(P, device=device)[:sample_limit_pos]
+        uv_pos, r_pos = uv_pos[:, idx], r_pos[idx]; P = int(uv_pos.size(1))
+
+    if sample_limit_neg is None: sample_limit_neg = P * neg_ratio_eval
+    neg_uv = sample_neg_pairs(uv_pos, graph.node_domain, graph.nodes_by_domain,
+                              k=int(neg_ratio_eval), device=device)
+    N = int(neg_uv.size(1)) if neg_uv is not None else 0
+    if N > sample_limit_neg:
+        idxn = torch.randperm(N, device=device)[:sample_limit_neg]
+        neg_uv = neg_uv[:, idxn]; N = int(neg_uv.size(1))
+
+    H = encoder(edge_index, graph.edge_type.to(device))
+
+    logits_pos=[]; 
+    for st in range(0, P, batch):
+        ed = min(st+batch, P)
+        logits_pos.append(joint_head(H[uv_pos[0,st:ed]], H[uv_pos[1,st:ed]]))
+    logits_pos = torch.cat(logits_pos, dim=0) if len(logits_pos)>0 else torch.empty((0, num_rel+1), device=device)
+    y_pos = r_pos + 1
+
+    logits_neg=[]
+    if N>0:
+        for st in range(0, N, batch):
+            ed = min(st+batch, N)
+            logits_neg.append(joint_head(H[neg_uv[0,st:ed]], H[neg_uv[1,st:ed]]))
+    logits_neg = torch.cat(logits_neg, dim=0) if len(logits_neg)>0 else torch.empty((0, num_rel+1), device=device)
+    y_neg = torch.zeros((N,), dtype=torch.long, device=device)
+
+    logits = torch.cat([logits_pos, logits_neg], dim=0)
+    labels = torch.cat([y_pos, y_neg], dim=0)
+    T = int(labels.numel())
+    if T == 0:
+        z = torch.tensor(0.0, device=device); C = num_rel+1
+        return {"acc": z, "auc_macro": z, "mrr": z, "hits10": z,
+                "micro_f1": z, "macro_f1": z, "weighted_f1": z,
+                "per_class_f1": torch.zeros(C, device=device), "n_pos": 0, "n_neg": 0}
+
+    probs = F.softmax(logits, dim=-1)
+    pred  = probs.argmax(dim=1)
+    acc = (pred == labels).float().mean()
+
+    C = num_rel + 1
+    f1s = torch.zeros(C, device=device); supports = torch.zeros(C, device=device)
+    for c in range(C):
+        tp = ((pred == c) & (labels == c)).sum().item()
+        fp = ((pred == c) & (labels != c)).sum().item()
+        fn = ((pred != c) & (labels == c)).sum().item()
+        supp = (labels == c).sum().item()
+        supports[c] = float(supp)
+        prec = tp / max(1, tp+fp); rec = tp / max(1, tp+fn)
+        f1s[c] = 2*prec*rec / max(1e-12, (prec+rec)) if (prec+rec) > 0 else 0.0
+    macro_f1 = f1s.mean()
+    weighted_f1 = ((supports/float(T))*f1s).sum()
+
+    # 멀티클래스 MRR/H@10 (클래스 확률 랭크)
+    s_true = probs.gather(1, labels.view(-1,1)).squeeze(1)
+    ranks = 1 + (probs > s_true.unsqueeze(1)).sum(dim=1)
+    hits10 = (ranks <= min(C,10)).float().mean()
+    mrr = (1.0/ranks.float()).mean()
+
+    # OVR AUC macro
+    auc_sum=0.0; auc_cnt=0
+    for c in range(C):
+        y_bin = (labels==c); n_pos = int(y_bin.sum().item()); n_neg = T - n_pos
+        if n_pos==0 or n_neg==0: continue
+        s = probs[:, c]
+        sorted_s, order = torch.sort(s)
+        rks = torch.empty_like(order, dtype=torch.float); rks[order]=torch.arange(1,T+1, device=device, dtype=torch.float)
+        pos_rks = rks[y_bin]
+        auc_c = (pos_rks.sum() - (n_pos*(n_pos+1)/2.0)) / (n_pos*n_neg + 1e-12)
+        auc_sum += float(auc_c.item()); auc_cnt += 1
+    auc_macro = torch.tensor(auc_sum/max(1,auc_cnt), device=device)
+
+    return {
+        "acc": acc, "auc_macro": auc_macro, "mrr": mrr, "hits10": hits10,
+        "micro_f1": acc.clone(), "macro_f1": macro_f1, "weighted_f1": weighted_f1,
+        "per_class_f1": f1s, "n_pos": P, "n_neg": N
+    }
+
+with torch.no_grad():
+    metrics_joint = eval_joint_reltype_with_nolink(
+        encoder, joint_head, tgt, num_rel=data.num_rel,
+        restrict_pairs=keep_tgt_pairs_inter,
+        neg_ratio_eval=JOINT_NEG_RATIO_EVAL,
+        sample_limit_pos=getattr(args, "eval_sample_limit", 4096),
+        sample_limit_neg=None, batch=2048, device=device
+    )
+
+print(
+    "[Joint (No_Link 포함, 1+R)] "
+    f"ACC={metrics_joint['acc']:.4f} "
+    f"AUCm={metrics_joint['auc_macro']:.4f} "
+    f"MRR={metrics_joint['mrr']:.4f} "
+    f"H@10={metrics_joint['hits10']:.4f} "
+    f"WeightedF1={metrics_joint['weighted_f1']:.4f} "
+    f"(n_pos={metrics_joint['n_pos']}, n_neg={metrics_joint['n_neg']})"
+)
+
+AI, MB, AE = 0, 1, 2
+keep_tgt_pairs_inter = {(AI, AE), (AE, AI)}  # 양방향
+
+@torch.no_grad()
+def get_H(encoder: nn.Module, graph, device=None):
+    if device is None: device = next(encoder.parameters()).device
+    ei = graph.edge_index.to(device=device, dtype=torch.long).contiguous()
+    et = graph.edge_type.to(device=device, dtype=torch.long).contiguous()
+    return encoder(ei, et)
+
+@torch.no_grad()
+def eval_joint_micro(
+    H, edge_index, edge_type, head, node_domain, nodes_by_domain, restrict_pairs,
+    neg_ratio_eval=JOINT_NEG_RATIO_EVAL, sample_limit=8192, device=None, batch=4096, n_thr=101
+):
+    if device is None: device = H.device
+    edge_index = edge_index.to(device=device, dtype=torch.long).contiguous()
+    edge_type  = edge_type.to(device=device, dtype=torch.long).contiguous()
+    nd         = node_domain.to(device=device, dtype=torch.long)
+    Eh = edge_index.size(1)//2
+    if Eh == 0:
+        return {"thr_best": 0.5, "f1_best": torch.tensor(0.0, device=device),
+                "acc_best": torch.tensor(0.0, device=device), "n_pos": 0, "n_neg": 0}
+
+    uv_pos = edge_index[:, :Eh]
+    ds, dt = nd[uv_pos[0]], nd[uv_pos[1]]
+    mask = torch.zeros(Eh, dtype=torch.bool, device=device)
+    for (a,b) in restrict_pairs: mask |= ((ds==a)&(dt==b))
+    uv_pos = uv_pos[:, mask]; P = int(uv_pos.size(1))
+    if P == 0:
+        return {"thr_best": 0.5, "f1_best": torch.tensor(0.0, device=device),
+                "acc_best": torch.tensor(0.0, device=device), "n_pos": 0, "n_neg": 0}
+
+    if sample_limit and P > sample_limit:
+        idx = torch.randperm(P, device=device)[:sample_limit]
+        uv_pos = uv_pos[:, idx]; P = int(uv_pos.size(1))
+
+    neg_uv = sample_neg_pairs(uv_pos, node_domain, nodes_by_domain, k=int(neg_ratio_eval), device=device)
+    N = int(neg_uv.size(1)) if neg_uv is not None else 0
+
+    head.eval()
+    def _p_link_for_pairs(uv):
+        if uv is None or uv.numel()==0: return torch.empty(0, device=device)
+        scores=[]
+        for st in range(0, uv.size(1), batch):
+            ed = min(st+batch, uv.size(1))
+            logits = head(H[uv[0,st:ed]], H[uv[1,st:ed]])
+            prob = F.softmax(logits, dim=-1)
+            scores.append(1.0 - prob[:,0])
+        return torch.cat(scores, dim=0)
+
+    s_pos = _p_link_for_pairs(uv_pos)
+    s_neg = _p_link_for_pairs(neg_uv)
+    if s_pos.numel()==0 or s_neg.numel()==0:
+        return {"thr_best": 0.5, "f1_best": torch.tensor(0.0, device=device),
+                "acc_best": torch.tensor(0.0, device=device), "n_pos": int(s_pos.numel()), "n_neg": int(s_neg.numel())}
+
+    y_pos = torch.ones_like(s_pos, dtype=torch.long, device=device)
+    y_neg = torch.zeros_like(s_neg, dtype=torch.long, device=device)
+    scores = torch.cat([s_pos, s_neg], dim=0); labels = torch.cat([y_pos, y_neg], dim=0)
+
+    best_thr, best_f1, best_acc = 0.5, -1.0, 0.0
+    for t in torch.linspace(0.0, 1.0, steps=n_thr, device=device):
+        pred = (scores >= t).long()
+        tp = (pred.eq(1)&labels.eq(1)).sum().item()
+        fp = (pred.eq(1)&labels.eq(0)).sum().item()
+        fn = (pred.eq(0)&labels.eq(1)).sum().item()
+        tn = (pred.eq(0)&labels.eq(0)).sum().item()
+        prec = tp/max(1,tp+fp); rec = tp/max(1,tp+fn)
+        f1 = (2*prec*rec/max(1e-12,(prec+rec))) if (prec+rec)>0 else 0.0
+        acc = (tp+tn)/max(1,tp+tn+fp+fn)
+        if f1 > best_f1:
+            best_f1, best_thr, best_acc = f1, float(t.item()), acc
+
+    return {"thr_best": best_thr, "f1_best": torch.tensor(best_f1, device=device),
+            "acc_best": torch.tensor(best_acc, device=device), "n_pos": P, "n_neg": N}
+
+with torch.no_grad():
+    Ht_eval = get_H(encoder, tgt, device=device)
+    met_tgt = eval_joint_micro(
+        Ht_eval, tgt.edge_index, tgt.edge_type, joint_head,
+        tgt.node_domain, tgt.nodes_by_domain,
+        restrict_pairs=keep_tgt_pairs_inter,
+        neg_ratio_eval=JOINT_NEG_RATIO_EVAL,
+        sample_limit=getattr(args, "eval_sample_limit", 8192),
+        device=device
+    )
+thr_best = float(met_tgt["thr_best"])
+print(f"🔎 thr_best (AI↔MB, Micro) = {thr_best:.3f}")
+
+_NAME_KEYS_CANDS = ("name", "Name", "label", "title")
+def _extract_name(props: dict):
+    if not isinstance(props, dict): return None
+    for k in _NAME_KEYS_CANDS:
+        v = props.get(k)
+        if isinstance(v, str) and v.strip(): return v.strip()
+    return None
+def _coerce_int(x):
+    try: return int(x)
+    except Exception: return None
+
+def build_and_attach_idx_name_map_from_triplets(data, triples,
+                                                idx2id_attr_candidates=("idx2id","id_of_idx","orig_id","orig_ids")):
+    dbid2name = {}
+    for rec in triples:
+        for k in ("n","m"):
+            node = rec.get(k, {})
+            if not isinstance(node, dict): continue
+            dbid = node.get("identity", None)
+            name = _extract_name(node.get("properties", {}))
+            if dbid is not None and name:
+                dbid_i = _coerce_int(dbid)
+                if dbid_i is not None:
+                    dbid2name[dbid_i] = name
+    idx2dbid = None
+    for attr in idx2id_attr_candidates:
+        if hasattr(data, attr):
+            m = getattr(data, attr)
+            if torch.is_tensor(m): m = m.detach().cpu().tolist()
+            if isinstance(m, dict):
+                idx2dbid = { _coerce_int(i): _coerce_int(v) for i, v in m.items() }
+            elif isinstance(m, (list, tuple)):
+                idx2dbid = { int(i): _coerce_int(v) for i, v in enumerate(m) }
+            break
+    if idx2dbid is not None:
+        id2name = { int(idx): dbid2name.get(int(db), str(idx))
+                    for idx, db in idx2dbid.items() if idx is not None and db is not None }
+    else:
+        id2name = { int(db): nm for db, nm in dbid2name.items() }
+    data.id2name = id2name
+    data._id2name_cache = id2name
+    print(f"✅ Attached {len(id2name)} idx→name mappings from NM-triplets.")
+# 사용 예: build_and_attach_idx_name_map_from_triplets(tgt, triples)
+
+import pandas as pd
+
+ASSUME_IDX_IS_IDENTITY = False  # 필요하면 True
+
+def _extract_name_from_props(props, keys=("name","Name","label","title")):
+    if isinstance(props, dict):
+        for k in keys:
+            v = props.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return None
+
+def _parse_identity_from_elementId(elementId: str):
+    try:
+        return int(str(elementId).split(":")[-1])
+    except Exception:
+        return None
+
+def _build_idx2identity_from_subgraph(data):
+    # build_subgraph가 넘겨준 idx2orig_id가 최우선
+    if hasattr(data, "idx2orig_id") and data.idx2orig_id is not None:
+        return {i: v for i, v in enumerate(data.idx2orig_id) if v is not None}
+    return {}
+
+def _build_identity2name_from_nodes(data):
+    id2name = {}
+    if hasattr(data, "nodes") and isinstance(data.nodes, (list, tuple)):
+        for node in data.nodes:
+            if not isinstance(node, dict): 
+                continue
+            ident = node.get("identity", None)
+            if ident is None:
+                elid = node.get("elementId") or ((node.get("properties") or {}).get("elementId"))
+                if elid is not None:
+                    ident = _parse_identity_from_elementId(elid)
+            nm = _extract_name_from_props(node.get("properties", {}))
+            if ident is not None and nm:
+                try: id2name[int(ident)] = nm
+                except: pass
+    return id2name
+
+encoder.eval(); joint_head.eval()
+
+import pandas as pd
+
+encoder.eval(); joint_head.eval()
+
+def _score_pack(logits, *, score_mode="link", temperature=1.0, alpha_no_link_bias=0.0):
+    """
+    logits: [B, 1+R] (0: No_Link, 1..R: relations)
+    반환값:
+      p_link: 1 - p(No_Link)
+      p_best: max_rel_prob
+      winner_rel: argmax over 1..R  (No_Link는 제외)
+      score: 선택한 score_mode에 따른 최종 점수
+    """
+    # 온도/바이어스 보정
+    if alpha_no_link_bias != 0.0:
+        logits = logits.clone()
+        logits[:, 0] = logits[:, 0] - float(alpha_no_link_bias)
+    if temperature and temperature != 1.0:
+        logits = logits / float(temperature)
+
+    prob = F.softmax(logits, dim=-1)                  # [B, 1+R]
+    p_no  = prob[:, 0]
+    p_rel = prob[:, 1:]
+    p_best, winner_rel = torch.max(p_rel, dim=1)      # [B], [B] (0..R-1)
+
+    if score_mode == "link":
+        score = 1.0 - p_no
+    elif score_mode == "rel":
+        score = p_best
+    elif score_mode == "margin":
+        # 로짓 margin: max_rel_logit - no_link_logit
+        # (확률보다 덜 포화되고 랭킹 친화적)
+        max_rel_logit, _ = torch.max(logits[:, 1:], dim=1)
+        score = max_rel_logit - logits[:, 0]
+    else:
+        raise ValueError(f"Unknown score_mode: {score_mode}")
+
+    p_link = 1.0 - p_no
+    return p_link, p_best, winner_rel, score
+
+def predict_joint_flexible(
+    H, data, head,
+    directions=("AI->AE","AE->AI"),      # 기본: AI->MB만
+    thr=0.25,                    # 내가 직접 조절
+    score_mode="link",           # "link" | "rel" | "margin"
+    min_prob_rel=None,           # 관계타입 최소 확률 (예: 0.1~0.2)
+    temperature=1.0,
+    alpha_no_link_bias=0.0,      # No_Link 로짓 깎기 (예: 0.3~1.0)
+    top_k_per_src=None,          # 각 소스 노드별 상위 K 보정 포함 (예: 50)
+    batch=4096,
+    exclude_existing=True,
+    csv_path="scopus_pred_edges_AE.csv"
+):
+    device = H.device
+    R = int(data.num_rel)
+
+    # 안전 가드
+    N = int(getattr(data, "num_nodes"))
+    if H.size(0) < N:
+        raise RuntimeError(f"[FATAL] H.size(0)={H.size(0)} < data.num_nodes={N}")
+    if H.size(0) != N:
+        H = H.narrow(0, 0, N)
+
+    Eh = int(data.edge_index.size(1) // 2)
+    existing = set()
+    if exclude_existing and Eh > 0:
+        pos = data.edge_index[:, :Eh].detach().cpu().numpy().T.tolist()
+        existing.update((u, v) for u, v in pos)
+
+    dom_name = {0: "AI", 1: "MB", 2: "AE"}
+    dom_id   = {"AI": 0, "MB": 1, "AE": 2}
+
+    # rel id → 이름
+    id2rel = [None] * R
+    for name, rid in meta.rel2id.items():
+        if isinstance(rid, int) and 0 <= rid < R:
+            id2rel[rid] = str(name)
+    for i in range(R):
+        if id2rel[i] is None:
+            id2rel[i] = f"REL_{i}"
+
+    # idx→identity / identity→name
+    idx2identity = _build_idx2identity_from_subgraph(data)
+    id2name_nodes = _build_identity2name_from_nodes(data)
+
+    rows = []
+
+    for direc in directions:
+        if "->" not in direc:
+            raise ValueError(f"direction '{direc}' is invalid. ex) 'AI->MB")
+        s_dom_req, t_dom_req = direc.split("->")
+        s_id_req, t_id_req = dom_id[s_dom_req], dom_id[t_dom_req]
+
+        src_nodes = torch.nonzero(data.node_domain == s_id_req, as_tuple=False).view(-1).tolist()
+        dst_nodes = torch.nonzero(data.node_domain == t_id_req, as_tuple=False).view(-1).tolist()
+        if len(src_nodes) == 0 or len(dst_nodes) == 0:
+            print(f"[WARN] No nodes for direction {direc}. src={len(src_nodes)}, dst={len(dst_nodes)}")
+            continue
+
+        vs_all = torch.tensor(dst_nodes, device=device, dtype=torch.long)
+
+        for u in src_nodes:
+            scores_u = []
+            keep_idxs_u = []  # (local idx in vs_all, score, p_link, p_best, winner_rel)
+
+            for st in range(0, vs_all.numel(), batch):
+                ve = min(st + batch, vs_all.numel())
+                vs = vs_all[st:ve]
+                if vs.numel() == 0:
+                    continue
+
+                hu = H[u].unsqueeze(0).expand(vs.size(0), -1)
+                hv = H[vs]
+                logits = head(hu, hv)  # (B, 1+R)
+
+                p_link, p_best, winner_rel, score = _score_pack(
+                    logits,
+                    score_mode=score_mode,
+                    temperature=temperature,
+                    alpha_no_link_bias=alpha_no_link_bias
+                )
+
+                # 임계값 기반 1차 필터
+                mask_thr = (score >= float(thr))
+                if min_prob_rel is not None:
+                    mask_thr = mask_thr & (p_best >= float(min_prob_rel))
+
+                # 후보 기록 (threshold 통과분)
+                if mask_thr.any():
+                    kept = torch.nonzero(mask_thr, as_tuple=False).view(-1)
+                    for j in kept.tolist():
+                        keep_idxs_u.append((
+                            int(st + j),
+                            float(score[j].item()),
+                            float(p_link[j].item()),
+                            float(p_best[j].item()),
+                            int(winner_rel[j].item())
+                        ))
+
+                # Top-K 보정용으로 전체 점수(현재 배치)도 저장
+                scores_u.append((
+                    st,
+                    score.detach().to('cpu'),
+                    p_link.detach().to('cpu'),
+                    p_best.detach().to('cpu'),
+                    winner_rel.detach().to('cpu')
+                ))
+
+            # ─ Top-K per source 보정 ─
+            if top_k_per_src is not None and top_k_per_src > 0:
+                # 모든 배치를 이어붙여 상위 K 추출
+                score_cat = torch.cat([x[1] for x in scores_u], dim=0)  # CPU
+                plink_cat = torch.cat([x[2] for x in scores_u], dim=0)
+                pbest_cat = torch.cat([x[3] for x in scores_u], dim=0)
+                wrel_cat  = torch.cat([x[4] for x in scores_u], dim=0)
+                k = min(int(top_k_per_src), score_cat.numel())
+                if k > 0:
+                    topk_val, topk_idx = torch.topk(score_cat, k=k, largest=True, sorted=False)
+                    for idx_local in topk_idx.tolist():
+                        keep_idxs_u.append((
+                            int(idx_local),
+                            float(score_cat[idx_local].item()),
+                            float(plink_cat[idx_local].item()),
+                            float(pbest_cat[idx_local].item()),
+                            int(wrel_cat[idx_local].item())
+                        ))
+
+            # 중복 제거 (threshold 통과 + top-k)
+            if keep_idxs_u:
+                # 같은 v가 여러 경로로 들어오면 score 최대값만 남김
+                best_by_v = {}
+                for local_idx, sc, pl, pb, wr in keep_idxs_u:
+                    v = int(vs_all[local_idx].item())
+                    if exclude_existing and (u, v) in existing:
+                        continue
+                    key = (u, v)
+                    cur = best_by_v.get(key)
+                    if (cur is None) or (sc > cur[0]):
+                        best_by_v[key] = (sc, pl, pb, wr)
+
+                # 행으로 저장
+                for (uu, vv), (sc, pl, pb, wr) in best_by_v.items():
+                    # 도메인 가드 (AI→MB)
+                    src_dom_true = int(data.node_domain[int(uu)].item())
+                    dst_dom_true = int(data.node_domain[int(vv)].item())
+                    if src_dom_true != s_id_req or dst_dom_true != t_id_req:
+                        continue
+
+                    rid = int(wr)
+                    src_ident = idx2identity.get(int(uu))
+                    dst_ident = idx2identity.get(int(vv))
+                    src_name = id2name_nodes.get(src_ident, str(int(uu)))
+                    dst_name = id2name_nodes.get(dst_ident, str(int(vv)))
+                    rows.append((
+                        int(uu), int(vv),
+                        src_ident, dst_ident,
+                        float(pl), rid, id2rel[rid],
+                        src_name, dst_name,
+                        src_dom_true, dst_dom_true,
+                        float(sc), float(pb)  # score, p_best 추가
+                    ))
+
+    df = pd.DataFrame(
+        rows,
+        columns=[
+            "src_id", "dst_id",
+            "src_identity", "dst_identity",
+            "link_prob", "rel_id", "rel_type",
+            "src_name", "dst_name",
+            "src_dom_true", "dst_dom_true",
+            "score", "rel_prob_best"
+        ]
+    )
+
+    if not df.empty:
+        df = df.sort_values(["score", "link_prob", "rel_id"], ascending=[False, False, True]).reset_index(drop=True)
+        df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        print(f"💾 Saved predictions to: {csv_path}")
+        counts = df.value_counts(["src_dom_true","dst_dom_true"])
+        print("Domain counts (src_dom_true, dst_dom_true) -> count:")
+        print(counts.to_string())
+    else:
+        print("[INFO] No predictions kept. Try lowering 'thr', increasing 'top_k_per_src', or adding 'alpha_no_link_bias'.")
+
+    return df
+
+with torch.no_grad():
+    H_all = get_H(encoder, tgt, device=device)
+
+# ---------------------------------------------------------------------------
+# [수정] min_prob_rel=None으로 변경하여 관계 확신도 조건 끄기
+# ---------------------------------------------------------------------------
+df_pred = predict_joint_flexible(
+    H_all, tgt, joint_head,
+    directions=("AI->AE", "AE->AI"),
+    thr=0.4,                      # 0.0은 너무 많을 수 있으니 0.5 정도로 시작 추천
+    score_mode="link",
+    min_prob_rel=None,            # [핵심] None으로 설정해서 관계 확률 필터 끄기!
+    alpha_no_link_bias=0.0,
+    top_k_per_src=None,           
+    batch=4096,
+    exclude_existing=True,
+    csv_path="scopus_pred_edges_AE_Threshold.csv"
+)
+
+# 결과 확인
+if not df_pred.empty:
+    df_pred = df_pred.sort_values(by=["score"], ascending=False)
+    print(f"\n✅ 추출된 총 링크 수: {len(df_pred)}개")
+    print("Top 5 Links:")
+    print(df_pred[["src_name", "rel_type", "dst_name", "score", "rel_prob_best"]].head())
+else:
+    print("여전히 결과가 없다면 모델의 예측 점수 자체가 매우 낮은 상태입니다.")
+
+import pandas as pd, torch
+df = pd.read_csv("scopus_pred_edges_AE_Threshold.csv")
+# 예측된 dst_id들이 모두 MAN(=2)인지 실측 확인
+dom = tgt.node_domain.cpu().numpy()
+print(np.unique(dom[df["dst_id"].values]))  # => [2] 만 나와야 정상
+
+import json, pandas as pd, math
+from pathlib import Path
+
+# 경로
+PRED_IN  = "scopus_pred_edges_AE_Threshold.csv"
+JSON_KG  = "01.12_total.json"
+PRED_OUT = "01.20_pred_edges_named.csv"
+
+# ❗ 서브그래프의 idx → 원본 identity 매핑을 사용
+# build_subgraph가 tgt.idx2orig_id를 갖고 있으므로, 그것으로 직접 구성
+if hasattr(tgt, "idx2orig_id") and tgt.idx2orig_id is not None:
+    IDX2IDENTITY = { i: v for i, v in enumerate(tgt.idx2orig_id) if v is not None }
+else:
+    IDX2IDENTITY = {}  # 없으면 안전모드로 이름 복원 생략
+
+def load_json_bomsafe(path: str):
+    p = Path(path)
+    if not p.exists():
+        raise FileNotFoundError(f"JSON not found: {path}")
+    with open(p, "r", encoding="utf-8-sig") as f:
+        txt = f.read()
+    try:
+        return json.loads(txt)
+    except json.JSONDecodeError as e:
+        items = []
+        for line in txt.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+                items.append(obj)
+            except Exception:
+                pass
+        if items:
+            return items
+        raise e
+
+def _extract_name_from_any(d: dict):
+    if not isinstance(d, dict):
+        return None
+    props = d.get("properties", d) or {}
+    for k in ("name", "Name", "label", "title"):
+        v = props.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+def build_identity_maps(json_path: str):
+    data = load_json_bomsafe(json_path)
+
+    records = []
+    if isinstance(data, list):
+        records = data
+    elif isinstance(data, dict):
+        def walk(x):
+            if isinstance(x, dict):
+                if ("n" in x and "m" in x) or ("n" in x and "r" in x):
+                    records.append(x)
+                for v in x.values():
+                    walk(v)
+            elif isinstance(x, list):
+                for v in x:
+                    walk(v)
+        walk(data)
+    else:
+        records = []
+
+    id2name, id2props = {}, {}
+
+    def visit_node(node_like):
+        if not isinstance(node_like, dict):
+            return
+        ident = node_like.get("identity", None)
+        if ident is None:
+            return
+        try:
+            ident = int(ident)
+        except Exception:
+            return
+        props = node_like.get("properties", {}) or {}
+        if ident not in id2props:
+            id2props[ident] = props
+        nm = _extract_name_from_any(node_like)
+        if nm:
+            id2name[ident] = nm
+
+    for rec in records:
+        visit_node(rec.get("n"))
+        visit_node(rec.get("m"))
+
+    print(f"• identity→name loaded: {len(id2name)} | identity→properties: {len(id2props)}")
+    return id2name, id2props
+
+def _to_int_series(s):
+    def _coerce(x):
+        try:
+            if pd.isna(x): return None
+            return int(float(x))
+        except Exception:
+            return None
+    return s.apply(_coerce)
+
+id2name, id2props = build_identity_maps(JSON_KG)
+
+df = pd.read_csv(PRED_IN)
+if "src_id" not in df.columns or "dst_id" not in df.columns:
+    raise ValueError("pred_edges.csv에 'src_id'와 'dst_id' 컬럼이 필요합니다.")
+
+df["src_id"] = _to_int_series(df["src_id"])
+df["dst_id"] = _to_int_series(df["dst_id"])
+
+# ✅ idx→identity 매핑 적용 (없으면 안전모드: 이름 붙이지 않기)
+if isinstance(IDX2IDENTITY, dict) and len(IDX2IDENTITY) > 0:
+    df["src_identity"] = df["src_id"].map(IDX2IDENTITY)
+    df["dst_identity"] = df["dst_id"].map(IDX2IDENTITY)
+else:
+    print("⚠️ idx→identity 매핑이 없어 이름 복원을 생략합니다.")
+    df["src_identity"] = pd.NA
+    df["dst_identity"] = pd.NA
+
+def _map_name(identity):
+    if identity is None or (isinstance(identity, float) and math.isnan(identity)):
+        return None
+    return id2name.get(int(identity))
+
+def _map_props(identity):
+    if identity is None or (isinstance(identity, float) and math.isnan(identity)):
+        return {}
+    return id2props.get(int(identity), {})
+
+# 이름/프로퍼티
+if df["src_identity"].notna().any():
+    df["src_name"] = df["src_identity"].apply(_map_name).fillna(df["src_id"].astype(str))
+    df["dst_name"] = df["dst_identity"].apply(_map_name).fillna(df["dst_id"].astype(str))
+    df["src_properties"] = df["src_identity"].apply(lambda x: json.dumps(_map_props(x), ensure_ascii=False))
+    df["dst_properties"] = df["dst_identity"].apply(lambda x: json.dumps(_map_props(x), ensure_ascii=False))
+else:
+    # 안전모드: 이름 대신 인덱스
+    df["src_name"] = df["src_id"].astype(str)
+    df["dst_name"] = df["dst_id"].astype(str)
+    df["src_properties"] = "{}"
+    df["dst_properties"] = "{}"
+
+# 저장
+df.to_csv(PRED_OUT, index=False, encoding="utf-8-sig")
+print(f"💾 Saved predictions to: {PRED_OUT}")
+
+# 간단 검증: 예측 대상의 실제 도메인(서브그래프 기준)
+dom = tgt.node_domain.cpu().numpy()
+if len(df) > 0:
+    unique_dst = np.unique(dom[df["dst_id"].dropna().astype(int).values])
+    print("unique dst_dom (from graph):", unique_dst)  # 정상이라면 [2]만
+
